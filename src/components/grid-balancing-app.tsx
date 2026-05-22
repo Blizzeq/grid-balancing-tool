@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   AlertTriangleIcon,
   BellIcon,
@@ -14,10 +14,14 @@ import {
   GaugeIcon,
   HelpCircleIcon,
   InfoIcon,
+  PauseIcon,
+  PlayIcon,
+  RotateCcwIcon,
   ScrollTextIcon,
   SettingsIcon,
   ShieldCheckIcon,
   SparklesIcon,
+  StepForwardIcon,
   XIcon,
   ZapIcon,
   type LucideIcon,
@@ -62,7 +66,15 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { CONTRACT_TEMPLATES } from "@/lib/domain/contracts";
+import {
+  buildDecisionCandidates,
+  buildOrderImpactPreview,
+  pickBestDecisionCandidate,
+  type DecisionCandidate,
+} from "@/lib/domain/decisions";
 import { formatMwh, formatPln, formatPrice, pnlTone } from "@/lib/domain/format";
+import { buildDashboardMetrics, getTradablePeriods } from "@/lib/domain/metrics";
+import { buildKnownMarketTape, getScenarioSetupTrades } from "@/lib/domain/markets";
 import { SCENARIOS } from "@/lib/domain/scenarios";
 import { settleContractsForPeriod } from "@/lib/domain/contracts";
 import { settlePortfolio } from "@/lib/domain/settlement";
@@ -106,6 +118,10 @@ function colorForPnl(value: number): string {
   }
 
   return "text-muted-foreground";
+}
+
+function formatSignedMwh(value: number): string {
+  return `${value > 0 ? "+" : ""}${formatMwh(value)}`;
 }
 
 function MetricCard({
@@ -197,14 +213,22 @@ function TopStatusBar() {
   const mode = useSimulationStore((state) => state.mode);
   const setMode = useSimulationStore((state) => state.setMode);
   const currentPeriod = useSimulationStore((state) => state.currentPeriod);
+  const isRunning = useSimulationStore((state) => state.isRunning);
+  const isClosed = useSimulationStore((state) => state.isClosed);
+  const speed = useSimulationStore((state) => state.speed);
+  const toggleRun = useSimulationStore((state) => state.toggleRun);
+  const step = useSimulationStore((state) => state.step);
+  const runToEnd = useSimulationStore((state) => state.runToEnd);
+  const resetScenario = useSimulationStore((state) => state.resetScenario);
+  const setSpeed = useSimulationStore((state) => state.setSpeed);
   const scenario = useSimulationStore((state) => state.scenario);
   const period = scenario.periods[currentPeriod];
   const nextPeriod = scenario.periods[Math.min(currentPeriod + 1, scenario.periods.length - 1)];
 
   return (
     <header className="mx-2 mt-2 rounded-md border border-[#263f49] bg-[#0d1a20]/95 px-4 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
-      <div className="flex flex-wrap items-center gap-4 xl:flex-nowrap xl:gap-7">
-        <div className="flex min-w-[210px] flex-col gap-1">
+      <div className="flex flex-wrap items-center gap-4 xl:flex-nowrap xl:gap-4">
+        <div className="flex min-w-[190px] flex-col gap-1">
           <span className="text-[11px] text-muted-foreground">Scenario</span>
           <select
             aria-label="Scenario"
@@ -222,23 +246,34 @@ function TopStatusBar() {
           </select>
         </div>
         <StatusDivider />
-        <div className="flex items-center gap-3">
+        <div className="flex min-w-[250px] items-center gap-3">
           <div className="flex size-9 items-center justify-center rounded-full border border-[#4b626b]">
             <Clock3Icon data-icon="inline-start" />
           </div>
           <div className="flex flex-col gap-1">
             <span className="text-[11px] text-muted-foreground">Simulated Time</span>
             <div className="flex items-center gap-2">
-              <span className="metric-tabular text-sm font-semibold">2025-05-13</span>
+              <span className="metric-tabular whitespace-nowrap text-sm font-semibold">
+                2025-05-13
+              </span>
               <span className="metric-tabular text-sm font-semibold">{period.label}</span>
-              <Badge className="h-5 border border-primary/35 bg-primary/15 px-2 text-[11px] text-primary">
-                LIVE
+              <Badge
+                className={cn(
+                  "h-5 border px-2 text-[11px]",
+                  isClosed
+                    ? "border-muted bg-muted/30 text-muted-foreground"
+                    : isRunning
+                      ? "border-primary/35 bg-primary/15 text-primary"
+                      : "border-[var(--energy-warning)]/35 bg-[var(--energy-warning)]/10 text-[var(--energy-warning)]"
+                )}
+              >
+                {isClosed ? "CLOSED" : isRunning ? "LIVE" : "PAUSED"}
               </Badge>
             </div>
           </div>
         </div>
         <StatusDivider />
-        <div className="flex items-center gap-3">
+        <div className="flex min-w-[185px] items-center gap-3">
           <div className="flex size-9 items-center justify-center rounded-full border border-[#4b626b]">
             <Clock3Icon data-icon="inline-start" />
           </div>
@@ -250,14 +285,14 @@ function TopStatusBar() {
           </div>
         </div>
         <StatusDivider />
-        <div className="flex min-w-[95px] flex-col gap-1">
+        <div className="flex min-w-[90px] flex-col gap-1">
           <span className="text-[11px] text-muted-foreground">Market Time</span>
           <Badge className="w-fit border border-primary/35 bg-primary/15 px-2 text-[11px] text-primary">
             Intraday
           </Badge>
         </div>
         <StatusDivider />
-        <div className="flex min-w-[130px] flex-col gap-1">
+        <div className="flex min-w-[112px] flex-col gap-1">
           <span className="text-[11px] text-muted-foreground">Mode</span>
           <select
             aria-label="Game mode"
@@ -271,7 +306,62 @@ function TopStatusBar() {
             <option value="replay">Replay</option>
           </select>
         </div>
-        <div className="ml-auto flex items-center gap-3">
+        <StatusDivider />
+        <div className="flex min-w-[360px] items-center gap-2">
+          <Button
+            aria-label={isRunning ? "Pause simulation" : "Play simulation"}
+            className="h-8 rounded-md px-3 text-xs"
+            disabled={isClosed && !isRunning}
+            variant="outline"
+            onClick={toggleRun}
+          >
+            {isRunning ? (
+              <PauseIcon data-icon="inline-start" />
+            ) : (
+              <PlayIcon data-icon="inline-start" />
+            )}
+            {isRunning ? "Pause" : "Play"}
+          </Button>
+          <Button
+            aria-label="Step 15 minutes"
+            className="h-8 rounded-md px-3 text-xs"
+            disabled={isClosed}
+            variant="outline"
+            onClick={step}
+          >
+            <StepForwardIcon data-icon="inline-start" />
+            Step
+          </Button>
+          <Button
+            className="h-8 rounded-md px-3 text-xs"
+            disabled={isClosed}
+            variant="outline"
+            onClick={runToEnd}
+          >
+            Run to end
+          </Button>
+          <Button
+            aria-label="Reset scenario"
+            className="h-8 rounded-md px-2"
+            variant="outline"
+            onClick={resetScenario}
+          >
+            <RotateCcwIcon data-icon="inline-start" />
+          </Button>
+          <select
+            aria-label="Simulation speed"
+            className="h-8 rounded-md border border-[#2b4550] bg-[#0a1418] px-2 text-xs text-foreground outline-none"
+            value={speed}
+            onChange={(event) => setSpeed(Number(event.target.value))}
+          >
+            {[0.5, 1, 2, 4, 8].map((candidate) => (
+              <option key={candidate} value={candidate}>
+                {candidate}x
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="ml-auto flex items-center gap-2">
           <Button variant="ghost" size="icon-sm" aria-label="Notifications">
             <BellIcon data-icon="inline-start" />
           </Button>
@@ -290,6 +380,11 @@ function TopStatusBar() {
 function TradingShell({ children }: { children: React.ReactNode }) {
   const activeView = useSimulationStore((state) => state.activeView);
   const setView = useSimulationStore((state) => state.setView);
+  const scenario = useSimulationStore((state) => state.scenario);
+  const currentPeriod = useSimulationStore((state) => state.currentPeriod);
+  const speed = useSimulationStore((state) => state.speed);
+  const statusMessage = useSimulationStore((state) => state.statusMessage);
+  const isClosed = useSimulationStore((state) => state.isClosed);
 
   return (
     <div className="min-h-screen bg-[#071115] text-foreground xl:h-screen xl:overflow-hidden">
@@ -356,20 +451,30 @@ function TradingShell({ children }: { children: React.ReactNode }) {
             <div className="flex items-center gap-8">
               <span className="flex items-center gap-2">
                 <InfoIcon data-icon="inline-start" />
-                Data Source: PolPX, PSE, OSP
+                Data Source: {scenario.metadata.source}
               </span>
               <span className="metric-tabular flex items-center gap-2">
-                Last Updated: 10:45:15
+                Last Updated: {scenario.metadata.deliveryDate}{" "}
+                {scenario.periods[currentPeriod]?.label ?? "00:00"}
                 <span className="size-1.5 rounded-full bg-primary" />
               </span>
+              <span className="max-w-[520px] truncate">Status: {statusMessage}</span>
             </div>
             <div className="flex items-center gap-8">
               <span>
-                Market: <span className="text-primary">Connected</span>
-                <span className="ml-2 inline-flex size-1.5 rounded-full bg-primary" />
+                Market:{" "}
+                <span className={isClosed ? "text-muted-foreground" : "text-primary"}>
+                  {isClosed ? "Closed" : "Connected"}
+                </span>
+                <span
+                  className={cn(
+                    "ml-2 inline-flex size-1.5 rounded-full",
+                    isClosed ? "bg-muted-foreground" : "bg-primary"
+                  )}
+                />
               </span>
               <span className="flex items-center gap-2">
-                Simulation Speed: <span className="font-medium text-foreground">1x</span>
+                Simulation Speed: <span className="font-medium text-foreground">{speed}x</span>
                 <ChevronDownIcon data-icon="inline-end" />
               </span>
             </div>
@@ -382,32 +487,29 @@ function TradingShell({ children }: { children: React.ReactNode }) {
 
 function OrderTicket() {
   const scenario = useSimulationStore((state) => state.scenario);
+  const contracts = useSimulationStore((state) => state.contracts);
+  const trades = useSimulationStore((state) => state.trades);
   const currentPeriod = useSimulationStore((state) => state.currentPeriod);
   const selectedPeriod = useSimulationStore((state) => state.selectedPeriod);
   const setSelectedPeriod = useSimulationStore((state) => state.setSelectedPeriod);
   const orderDraft = useSimulationStore((state) => state.orderDraft);
   const updateOrderDraft = useSimulationStore((state) => state.updateOrderDraft);
   const placeOrder = useSimulationStore((state) => state.placeOrder);
+  const isClosed = useSimulationStore((state) => state.isClosed);
   const period = scenario.periods[selectedPeriod] ?? scenario.periods[currentPeriod];
-  const nextTradablePeriods = scenario.periods.slice(
-    Math.min(currentPeriod + 1, scenario.periods.length - 1),
-    Math.min(currentPeriod + 17, scenario.periods.length)
+  const nextTradablePeriods = getTradablePeriods(scenario, currentPeriod).slice(0, 16);
+  const canTrade = !isClosed && nextTradablePeriods.length > 0;
+  const orderImpact = useMemo(
+    () => buildOrderImpactPreview(scenario, contracts, trades, currentPeriod, orderDraft),
+    [scenario, contracts, trades, currentPeriod, orderDraft]
   );
-  const ticketPrice = {
-    bid: 324.5,
-    last: 325,
-    ask: 325.5,
-    bidVolume: 123.4,
-    lastVolume: 45.6,
-    askVolume: 98.7,
-  };
 
   return (
     <DashboardCard
       title="Intraday Order Ticket"
       action={
-        <Badge className="h-5 border border-[#4d4118] bg-[#17170d] px-2 text-[11px] text-[var(--energy-warning)]">
-          RDN
+        <Badge className="h-5 border border-primary/30 bg-primary/10 px-2 text-[11px] text-primary">
+          RDB/SIDC
         </Badge>
       }
       className="xl:h-[402px]"
@@ -448,15 +550,15 @@ function OrderTicket() {
         <div className="grid grid-cols-2 gap-2">
           <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
             Product
-            <select className="h-7 rounded-md border border-[#2b4550] bg-[#0a1418] px-2 text-xs text-foreground outline-none">
-              <option>RDN</option>
-              <option>RDB</option>
-            </select>
+            <div className="flex h-7 items-center rounded-md border border-[#2b4550] bg-[#0a1418] px-2 text-xs text-foreground">
+              RDB continuous
+            </div>
           </label>
           <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
             Delivery
             <select
               className="h-7 rounded-md border border-[#2b4550] bg-[#0a1418] px-2 text-xs text-foreground outline-none"
+              disabled={!canTrade}
               value={selectedPeriod}
               onChange={(event) => setSelectedPeriod(Number(event.target.value))}
             >
@@ -536,40 +638,64 @@ function OrderTicket() {
           <div className="rounded-md border border-[#2b4550] bg-[#0a1418] p-2">
             <span className="whitespace-nowrap text-[10px] text-muted-foreground">Best Bid (PLN/MWh)</span>
             <div className="metric-tabular text-lg font-semibold text-primary">
-              {ticketPrice.bid.toFixed(2)}
+              {period.intradayBid.toFixed(2)}
             </div>
             <span className="text-[10px] text-muted-foreground">Volume (MWh)</span>
-            <div className="metric-tabular text-xs">{ticketPrice.bidVolume.toFixed(1)}</div>
+            <div className="metric-tabular text-xs">{period.liquidityMwh.toFixed(1)}</div>
           </div>
           <div className="rounded-md border border-[#2b4550] bg-[#0a1418] p-2">
-            <span className="whitespace-nowrap text-[10px] text-muted-foreground">Last Price (PLN/MWh)</span>
+            <span className="whitespace-nowrap text-[10px] text-muted-foreground">RDN Ref (PLN/MWh)</span>
             <div className="metric-tabular text-lg font-semibold">
-              {ticketPrice.last.toFixed(2)}
+              {period.rdnPrice.toFixed(2)}
             </div>
             <span className="text-[10px] text-muted-foreground">Volume (MWh)</span>
-            <div className="metric-tabular text-xs">{ticketPrice.lastVolume.toFixed(1)}</div>
+            <div className="metric-tabular text-xs">{Math.max(orderDraft.volumeMwh, 0).toFixed(1)}</div>
           </div>
           <div className="rounded-md border border-[#2b4550] bg-[#0a1418] p-2">
             <span className="whitespace-nowrap text-[10px] text-muted-foreground">Best Ask (PLN/MWh)</span>
             <div className="metric-tabular text-lg font-semibold text-[var(--energy-negative)]">
-              {ticketPrice.ask.toFixed(2)}
+              {period.intradayAsk.toFixed(2)}
             </div>
             <span className="text-[10px] text-muted-foreground">Volume (MWh)</span>
-            <div className="metric-tabular text-xs">{ticketPrice.askVolume.toFixed(1)}</div>
+            <div className="metric-tabular text-xs">{period.liquidityMwh.toFixed(1)}</div>
           </div>
         </div>
-        <Button className="h-8 rounded-md bg-primary text-xs text-primary-foreground hover:bg-primary/90" onClick={placeOrder}>
+        <Button
+          className="h-8 rounded-md bg-primary text-xs text-primary-foreground hover:bg-primary/90"
+          disabled={!canTrade}
+          onClick={placeOrder}
+        >
           Place {orderDraft.side === "buy" ? "Buy" : "Sell"} Order
         </Button>
-        <div className="grid grid-cols-2 gap-3 pt-1 text-xs">
+        <div className="grid grid-cols-3 gap-3 pt-1 text-xs">
           <div>
             <div className="text-muted-foreground">Available Capacity</div>
-            <div className="metric-tabular text-sm">120.3 MWh</div>
+            <div className="metric-tabular text-sm">{formatMwh(period.liquidityMwh)}</div>
           </div>
           <div>
-            <div className="text-muted-foreground">Cash (PLN)</div>
-            <div className="metric-tabular text-sm">12,845,220</div>
+            <div className="text-muted-foreground">Impact</div>
+            <div className={cn("metric-tabular text-sm", colorForPnl(orderImpact.pnlImpact))}>
+              {formatPln(orderImpact.pnlImpact)}
+            </div>
           </div>
+          <div>
+            <div className="text-muted-foreground">Risk Cut</div>
+            <div
+              className={cn(
+                "metric-tabular text-sm",
+                orderImpact.imbalanceReductionMwh > 0
+                  ? "text-primary"
+                  : "text-muted-foreground"
+              )}
+            >
+              {formatMwh(Math.max(orderImpact.imbalanceReductionMwh, 0))}
+            </div>
+          </div>
+        </div>
+        <div className="truncate text-[10px] text-muted-foreground">
+          {orderImpact.accepted
+            ? `After order: ${formatSignedMwh(orderImpact.afterImbalanceMwh)} expected imbalance`
+            : orderImpact.reason}
         </div>
       </div>
     </DashboardCard>
@@ -664,64 +790,72 @@ function DashboardView() {
   const trades = useSimulationStore((state) => state.trades);
   const currentPeriod = useSimulationStore((state) => state.currentPeriod);
 
-  const fullSettlement = useMemo(
-    () => settlePortfolio(scenario.periods, contracts, trades),
-    [scenario.periods, contracts, trades]
+  const metrics = useMemo(
+    () => buildDashboardMetrics(scenario, contracts, trades, currentPeriod),
+    [scenario, contracts, trades, currentPeriod]
   );
+  const scenarioSetupTrades = useMemo(() => getScenarioSetupTrades(trades), [trades]);
   const botPreview = useMemo(
-    () => runAutopilot(scenario, contracts),
-    [scenario, contracts]
+    () => runAutopilot(scenario, contracts, undefined, scenarioSetupTrades),
+    [scenario, contracts, scenarioSetupTrades]
   );
-  const forecastHorizon = scenario.periods.slice(0, 96);
-  const currentPosition = 42.3;
-  const displayedRdnImbalance = -12.1;
-  const displayedRdbImbalance = 5.7;
-  const chartData = scenario.periods.map((period, index) => ({
-    label: period.label,
-    portfolio:
-      index <= currentPeriod + 8
-        ? Number(
-            (
-              Math.sin(index * 0.43) * 22 +
-              Math.sin(index * 0.91) * 12 -
-              Math.max(0, 24 - index) * 1.25 +
-              Math.max(0, index - 36) * 5.5
-            ).toFixed(1)
-          )
-        : null,
-    upper: 100,
-    lower: -100,
+  const botProjectedSettlement = useMemo(
+    () =>
+      buildDashboardMetrics(
+        scenario,
+        contracts,
+        [...scenarioSetupTrades, ...botPreview.trades],
+        currentPeriod
+      ).projectedSettlement,
+    [scenario, contracts, scenarioSetupTrades, botPreview.trades, currentPeriod]
+  );
+  const currentPeriodSnapshot = scenario.periods[currentPeriod];
+  const forecastData = metrics.loadSeries.map((loadPoint, index) => ({
+    label: loadPoint.label,
+    forecastLoad: loadPoint.forecast,
+    actualLoad: loadPoint.actual,
+    forecastGeneration: metrics.generationSeries[index]?.forecast ?? null,
+    actualGeneration: metrics.generationSeries[index]?.actual ?? null,
   }));
-  const forecastData = forecastHorizon.map((period) => ({
-    label: period.label,
-    forecastGeneration: period.forecastGeneration * 120,
-    actualGeneration: period.actualGeneration * 120,
-    forecastLoad: period.forecastLoad * 155,
-    actualLoad: period.actualLoad * 155,
-  }));
-  const pnlWaterfall = [
-    { name: "Contracts\nMark-to-Market", value: 3450000 },
-    { name: "Realized\nRDN", value: 1120000 },
-    { name: "Realized\nRDB", value: 680000 },
-    { name: "Imbalance\nCost", value: -820650 },
-    { name: "Fees", value: -450300 },
-    { name: "Total\nPnL", value: 3975200 },
-  ];
-  const humanPnl = Math.max(fullSettlement.totalPnl + 3975200, 3975200);
-  const algoPnl = Math.max(botPreview.settlement.totalPnl + 4612780, 4612780);
+  const humanPnl = metrics.projectedSettlement.totalPnl;
+  const algoPnl = botProjectedSettlement.totalPnl;
   const pnlDelta = algoPnl - humanPnl;
-  const comparisonData = Array.from({ length: 13 }, (_, index) => ({
-    label: `May ${String(index + 1).padStart(2, "0")}`,
-    human: Math.max(0, humanPnl * (index / 12) + Math.sin(index * 1.7) * 120000),
-    algorithm: Math.max(0, algoPnl * (index / 12) + Math.cos(index * 1.2) * 150000),
-  }));
-  const signedRows = [
-    ["PGE", "BASE", "May 2025", "10,000", "295.00", "Active", "512,450"],
-    ["Tauron", "PEAK", "May 2025", "4,000", "325.00", "Active", "245,320"],
-    ["ZE PAK", "OFFPEAK", "May 2025", "6,000", "275.00", "Active", "-98,760"],
-    ["Orlen Poludnie", "BASE", "Jun 2025", "8,000", "290.00", "Active", "120,640"],
-    ["InterGen", "PEAK", "May 2025", "2,000", "335.00", "Active", "34,210"],
-  ];
+  const comparisonData = metrics.projectedSettlement.periods.reduce<{
+    rows: Array<{ label: string; human: number; algorithm: number }>;
+    human: number;
+    algorithm: number;
+  }>(
+    (accumulator, period, index) => {
+      const human = accumulator.human + period.periodPnl;
+      const algorithm =
+        accumulator.algorithm + (botProjectedSettlement.periods[index]?.periodPnl ?? 0);
+
+      if (index % 8 === 0 || index === metrics.projectedSettlement.periods.length - 1) {
+        accumulator.rows.push({
+          label: period.label,
+          human,
+          algorithm,
+        });
+      }
+
+      return {
+        rows: accumulator.rows,
+        human,
+        algorithm,
+      };
+    },
+    { rows: [], human: 0, algorithm: 0 }
+  ).rows;
+  const signedTotals = metrics.signedContracts.reduce(
+    (accumulator, contract) => {
+      accumulator.volumeMwh += contract.volumeMwh;
+      accumulator.mtmPln += contract.mtmPln;
+      return accumulator;
+    },
+    { volumeMwh: 0, mtmPln: 0 }
+  );
+  const outperformance =
+    Math.abs(humanPnl) > 0.01 ? (pnlDelta / Math.abs(humanPnl)) * 100 : 0;
 
   return (
     <div className="flex flex-col gap-2 p-2 xl:h-full xl:min-h-0">
@@ -731,13 +865,20 @@ function DashboardView() {
             title="Portfolio Balance (Live)"
             action={
               <div className="flex flex-wrap items-center gap-3">
-                <span className="metric-tabular text-xl font-semibold text-primary">
-                  +{currentPosition.toFixed(1)} MWh
+                <span
+                  className={cn(
+                    "metric-tabular text-xl font-semibold",
+                    metrics.currentPositionMwh >= 0
+                      ? "text-primary"
+                      : "text-[var(--energy-negative)]"
+                  )}
+                >
+                  {formatSignedMwh(metrics.currentPositionMwh)}
                 </span>
                 <span className="text-xs text-muted-foreground">
                   Imbalance:{" "}
                   <span className="metric-tabular text-foreground">
-                    {displayedRdnImbalance.toFixed(1)} MWh
+                    {formatSignedMwh(metrics.currentImbalanceMwh)}
                   </span>
                 </span>
                 <InfoIcon data-icon="inline-end" />
@@ -748,23 +889,23 @@ function DashboardView() {
             <div className="mb-2 flex flex-wrap gap-5 text-[11px]">
               <span className="flex items-center gap-2">
                 <span className="h-0.5 w-4 bg-primary" />
-                Portfolio Balance (MWh)
+                Realized Balance (MWh)
               </span>
               <span className="flex items-center gap-2 text-muted-foreground">
                 <span className="h-px w-4 border-t border-dashed border-muted-foreground" />
-                Upper Limit
+                Projected Balance
               </span>
               <span className="flex items-center gap-2 text-muted-foreground">
                 <span className="h-px w-4 border-t border-dashed border-muted-foreground" />
-                Lower Limit
+                Risk Limits
               </span>
             </div>
             <div className="h-[190px]">
               <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0} initialDimension={{ width: 1, height: 1 }}>
-                <LineChart data={chartData} margin={chartMargins}>
+                <LineChart data={metrics.balanceSeries} margin={chartMargins}>
                   <CartesianGrid stroke="#20333b" strokeDasharray="3 3" />
                   <XAxis dataKey="label" interval={11} tickLine={false} axisLine={false} />
-                  <YAxis domain={[-200, 200]} tickLine={false} axisLine={false} width={42} />
+                  <YAxis domain={[-150, 150]} tickLine={false} axisLine={false} width={42} />
                   <Tooltip
                     contentStyle={{
                       background: "var(--popover)",
@@ -772,16 +913,25 @@ function DashboardView() {
                       borderRadius: 6,
                     }}
                   />
-                  <ReferenceLine y={100} stroke="var(--energy-positive)" strokeDasharray="4 4" />
-                  <ReferenceLine y={-100} stroke="var(--energy-negative)" strokeDasharray="4 4" />
+                  <ReferenceLine y={metrics.maxPositionLimitMwh} stroke="var(--energy-positive)" strokeDasharray="4 4" />
+                  <ReferenceLine y={-metrics.maxPositionLimitMwh} stroke="var(--energy-negative)" strokeDasharray="4 4" />
                   <ReferenceLine x={scenario.periods[currentPeriod]?.label} stroke="#e5e7eb" strokeDasharray="5 4" />
                   <ReferenceLine y={0} stroke="#6f8188" />
                   <Line
                     dataKey="portfolio"
                     dot={false}
-                    name="Portfolio Balance"
+                    name="Realized Balance"
                     stroke="var(--energy-positive)"
                     strokeWidth={2}
+                    type="monotone"
+                  />
+                  <Line
+                    dataKey="projected"
+                    dot={false}
+                    name="Projected Balance"
+                    stroke="var(--energy-cyan)"
+                    strokeDasharray="5 4"
+                    strokeWidth={1.5}
                     type="monotone"
                   />
                 </LineChart>
@@ -790,22 +940,24 @@ function DashboardView() {
             <div className="mt-2 grid grid-cols-4 gap-2 border-t border-[#263f49] pt-2 text-center text-xs">
               <div>
                 <div className="text-muted-foreground">Max Position Limit</div>
-                <div className="metric-tabular mt-1">+/-150 MWh</div>
+                <div className="metric-tabular mt-1">+/-{metrics.maxPositionLimitMwh} MWh</div>
               </div>
               <div>
                 <div className="text-muted-foreground">Current Position</div>
-                <div className="metric-tabular mt-1 text-primary">+{currentPosition.toFixed(1)} MWh</div>
-              </div>
-              <div>
-                <div className="text-muted-foreground">Imbalance (RDN)</div>
-                <div className="metric-tabular mt-1 text-[var(--energy-negative)]">
-                  {displayedRdnImbalance.toFixed(1)} MWh
+                <div className={cn("metric-tabular mt-1", metrics.currentPositionMwh >= 0 ? "text-primary" : "text-[var(--energy-negative)]")}>
+                  {formatSignedMwh(metrics.currentPositionMwh)}
                 </div>
               </div>
               <div>
-                <div className="text-muted-foreground">Imbalance (RDB)</div>
-                <div className="metric-tabular mt-1 text-[var(--energy-warning)]">
-                  +{displayedRdbImbalance.toFixed(1)} MWh
+                <div className="text-muted-foreground">Contracted</div>
+                <div className={cn("metric-tabular mt-1", metrics.currentContractedMwh >= 0 ? "text-primary" : "text-[var(--energy-negative)]")}>
+                  {formatSignedMwh(metrics.currentContractedMwh)}
+                </div>
+              </div>
+              <div>
+                <div className="text-muted-foreground">Market Trades</div>
+                <div className={cn("metric-tabular mt-1", metrics.currentMarketMwh >= 0 ? "text-primary" : "text-[var(--energy-warning)]")}>
+                  {formatSignedMwh(metrics.currentMarketMwh)}
                 </div>
               </div>
             </div>
@@ -817,7 +969,7 @@ function DashboardView() {
           >
             <div className="h-[178px]">
               <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0} initialDimension={{ width: 1, height: 1 }}>
-                <BarChart data={pnlWaterfall} margin={{ left: 0, right: 8, top: 8, bottom: 0 }}>
+                <BarChart data={metrics.pnlWaterfall} margin={{ left: 0, right: 8, top: 8, bottom: 0 }}>
                   <CartesianGrid stroke="#20333b" strokeDasharray="3 3" />
                   <XAxis
                     dataKey="name"
@@ -843,11 +995,11 @@ function DashboardView() {
                   />
                   <ReferenceLine y={0} stroke="#6f8188" />
                   <Bar dataKey="value" radius={[2, 2, 0, 0]}>
-                    {pnlWaterfall.map((entry) => (
+                    {metrics.pnlWaterfall.map((entry) => (
                       <Cell
                         key={entry.name}
                         fill={
-                          entry.name.startsWith("Total")
+                          entry.kind === "total"
                             ? "var(--energy-cyan)"
                             : entry.value >= 0
                               ? "var(--energy-positive)"
@@ -862,19 +1014,30 @@ function DashboardView() {
             <div className="grid grid-cols-4 gap-2 border-t border-[#263f49] pt-2 text-xs">
               <div>
                 <div className="text-muted-foreground">Total PnL (MTD)</div>
-                <div className="metric-tabular text-primary">3,975,200 PLN</div>
+                <div className={cn("metric-tabular", colorForPnl(metrics.projectedSettlement.totalPnl))}>
+                  {formatPln(metrics.projectedSettlement.totalPnl)}
+                </div>
               </div>
               <div>
                 <div className="text-muted-foreground">PnL per MWh</div>
-                <div className="metric-tabular">38.52 PLN/MWh</div>
+                <div className="metric-tabular">
+                  {formatPrice(
+                    metrics.projectedSettlement.totalPnl /
+                      Math.max(metrics.projectedSettlement.totalImbalanceAbsMwh, 1)
+                  )}
+                </div>
               </div>
               <div>
                 <div className="text-muted-foreground">Imbalance Cost</div>
-                <div className="metric-tabular text-[var(--energy-negative)]">-820,650 PLN</div>
+                <div className={cn("metric-tabular", colorForPnl(metrics.projectedSettlement.imbalancePnl))}>
+                  {formatPln(metrics.projectedSettlement.imbalancePnl)}
+                </div>
               </div>
               <div>
                 <div className="text-muted-foreground">Fees</div>
-                <div className="metric-tabular text-[var(--energy-negative)]">-450,300 PLN</div>
+                <div className="metric-tabular text-[var(--energy-negative)]">
+                  {formatPln(-metrics.projectedSettlement.transactionFees)}
+                </div>
               </div>
             </div>
           </DashboardCard>
@@ -914,7 +1077,7 @@ function DashboardView() {
                   <CartesianGrid stroke="#20333b" strokeDasharray="3 3" />
                   <XAxis dataKey="label" interval={15} tickLine={false} axisLine={false} />
                   <YAxis
-                    tickFormatter={(value) => `${Number(value) / 1000}`}
+                    tickFormatter={(value) => Number(value).toFixed(0)}
                     tickLine={false}
                     axisLine={false}
                     width={42}
@@ -936,11 +1099,11 @@ function DashboardView() {
             </div>
             <div className="mt-2 grid grid-cols-5 gap-2 border-t border-[#263f49] pt-2 text-xs">
               {[
-                ["Load (Actual)", "3,842 MWh", "text-[var(--energy-cyan)]"],
-                ["Load (Forecast)", "3,910 MWh", "text-[var(--energy-cyan)]"],
-                ["Generation (Actual)", "2,615 MWh", "text-[var(--energy-warning)]"],
-                ["Generation (Forecast)", "2,710 MWh", "text-[var(--energy-warning)]"],
-                ["Net Position", `+${currentPosition.toFixed(1)} MWh`, "text-primary"],
+                ["Load (Actual)", formatMwh(currentPeriodSnapshot.actualLoad), "text-[var(--energy-cyan)]"],
+                ["Load (Forecast)", formatMwh(currentPeriodSnapshot.forecastLoad), "text-[var(--energy-cyan)]"],
+                ["Generation (Actual)", formatMwh(currentPeriodSnapshot.actualGeneration), "text-[var(--energy-warning)]"],
+                ["Generation (Forecast)", formatMwh(currentPeriodSnapshot.forecastGeneration), "text-[var(--energy-warning)]"],
+                ["Net Position", formatSignedMwh(metrics.currentPositionMwh), metrics.currentPositionMwh >= 0 ? "text-primary" : "text-[var(--energy-negative)]"],
               ].map(([label, value, className]) => (
                 <div key={label}>
                   <div className="text-muted-foreground">{label}</div>
@@ -965,40 +1128,39 @@ function DashboardView() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {signedRows.map((row) => (
-                  <TableRow key={row.join("-")}>
-                    {row.map((cell, index) => (
-                      <TableCell
-                        key={`${row[0]}-${cell}-${index}`}
-                        className={cn(
-                          "h-8 px-1.5 py-1 text-xs",
-                          index === 1 && "font-semibold",
-                          index === 5 && "text-primary",
-                          index === 6 &&
-                            (cell.startsWith("-")
-                              ? "metric-tabular text-[var(--energy-negative)]"
-                              : "metric-tabular text-primary")
-                        )}
-                      >
-                        {index === 5 ? (
-                          <Badge className="h-5 border border-primary/30 bg-primary/10 px-2 text-[11px] text-primary">
-                            {cell}
-                          </Badge>
-                        ) : (
-                          cell
-                        )}
-                      </TableCell>
-                    ))}
+                {metrics.signedContracts.map((contract) => (
+                  <TableRow key={contract.id}>
+                    <TableCell className="h-8 px-1.5 py-1 text-xs">{contract.counterparty}</TableCell>
+                    <TableCell className="h-8 px-1.5 py-1 text-xs font-semibold">{contract.product}</TableCell>
+                    <TableCell className="h-8 px-1.5 py-1 text-xs">{contract.deliveryPeriod}</TableCell>
+                    <TableCell className="metric-tabular h-8 px-1.5 py-1 text-xs">
+                      {formatMwh(contract.volumeMwh)}
+                    </TableCell>
+                    <TableCell className="metric-tabular h-8 px-1.5 py-1 text-xs">
+                      {contract.pricePlnMwh.toFixed(2)}
+                    </TableCell>
+                    <TableCell className="h-8 px-1.5 py-1 text-xs">
+                      <Badge className="h-5 border border-primary/30 bg-primary/10 px-2 text-[11px] text-primary">
+                        {contract.status}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className={cn("metric-tabular h-8 px-1.5 py-1 text-xs", colorForPnl(contract.mtmPln))}>
+                      {formatPln(contract.mtmPln)}
+                    </TableCell>
                   </TableRow>
                 ))}
                 <TableRow>
                   <TableCell className="h-8 px-1.5 py-1 text-xs font-medium">Total</TableCell>
                   <TableCell />
                   <TableCell />
-                  <TableCell className="metric-tabular h-8 px-1.5 py-1 text-xs">30,000</TableCell>
+                  <TableCell className="metric-tabular h-8 px-1.5 py-1 text-xs">
+                    {formatMwh(signedTotals.volumeMwh)}
+                  </TableCell>
                   <TableCell />
                   <TableCell />
-                  <TableCell className="metric-tabular h-8 px-1.5 py-1 text-xs text-primary">813,860</TableCell>
+                  <TableCell className={cn("metric-tabular h-8 px-1.5 py-1 text-xs", colorForPnl(signedTotals.mtmPln))}>
+                    {formatPln(signedTotals.mtmPln)}
+                  </TableCell>
                 </TableRow>
               </TableBody>
             </Table>
@@ -1012,35 +1174,29 @@ function DashboardView() {
             className="xl:h-[192px]"
           >
             <div className="flex flex-col gap-1">
-              {[
-                ["Imbalance Risk (RDN)", "Projected RDN imbalance -68.4 MWh at 11:00", "10:45:12", "danger"],
-                ["Position Limit", "Position 92.3% of limit (138.5 / 150 MWh)", "10:44:58", "warning"],
-                ["RDB Exposure", "High RDB buy exposure for 12:00 - 13:00", "10:44:33", "danger"],
-                ["Price Spike", "RDN price > 400 PLN/MWh at 11:15", "10:44:10", "info"],
-                ["Forecast Deviation", "Load forecast deviation +7.2% at 12:00", "10:43:55", "warning"],
-              ].map(([title, description, time, tone]) => (
-                <div key={title} className="grid grid-cols-[16px_112px_minmax(0,1fr)_52px] items-center gap-2 rounded-sm px-1 py-0.5 text-[10px] hover:bg-muted/25">
+              {metrics.riskAlerts.map((alert) => (
+                <div key={alert.id} className="grid grid-cols-[16px_112px_minmax(0,1fr)_52px] items-center gap-2 rounded-sm px-1 py-0.5 text-[10px] hover:bg-muted/25">
                   <AlertTriangleIcon
                     className={cn(
                       "size-4",
-                      tone === "danger" && "text-[var(--energy-negative)]",
-                      tone === "warning" && "text-[var(--energy-warning)]",
-                      tone === "info" && "text-[var(--energy-cyan)]"
+                      alert.tone === "danger" && "text-[var(--energy-negative)]",
+                      alert.tone === "warning" && "text-[var(--energy-warning)]",
+                      alert.tone === "info" && "text-[var(--energy-cyan)]"
                     )}
                     data-icon="inline-start"
                   />
                   <span
                     className={cn(
                       "font-medium",
-                      tone === "danger" && "text-[var(--energy-negative)]",
-                      tone === "warning" && "text-[var(--energy-warning)]",
-                      tone === "info" && "text-[var(--energy-cyan)]"
+                      alert.tone === "danger" && "text-[var(--energy-negative)]",
+                      alert.tone === "warning" && "text-[var(--energy-warning)]",
+                      alert.tone === "info" && "text-[var(--energy-cyan)]"
                     )}
                   >
-                    {title}
+                    {alert.title}
                   </span>
-                  <span className="truncate text-muted-foreground">{description}</span>
-                  <span className="metric-tabular text-right text-muted-foreground">{time}</span>
+                  <span className="truncate text-muted-foreground">{alert.description}</span>
+                  <span className="metric-tabular text-right text-muted-foreground">{alert.timeLabel}</span>
                 </div>
               ))}
             </div>
@@ -1071,26 +1227,26 @@ function DashboardView() {
           <div className="grid grid-cols-[1fr_1.1fr] gap-4">
             <div className="flex flex-col justify-center border-r border-[#2b4550] pr-4">
               <span className="text-xs text-muted-foreground">Human PnL</span>
-              <span className="metric-tabular text-xl font-semibold text-primary">
+              <span className={cn("metric-tabular text-xl font-semibold", colorForPnl(humanPnl))}>
                 {formatPln(humanPnl)}
               </span>
               <Separator className="my-4" />
               <span className="text-xs text-muted-foreground">Algorithm PnL</span>
-              <span className="metric-tabular text-xl font-semibold text-primary">
+              <span className={cn("metric-tabular text-xl font-semibold", colorForPnl(algoPnl))}>
                 {formatPln(algoPnl)}
               </span>
             </div>
             <div className="my-auto grid grid-cols-2 rounded-md border border-[#2b4550] bg-muted/20 text-center">
               <div className="border-r border-[#2b4550] p-4">
                 <div className="text-xs text-muted-foreground">Difference</div>
-                <div className="metric-tabular mt-2 text-lg font-semibold text-primary">
+                <div className={cn("metric-tabular mt-2 text-lg font-semibold", colorForPnl(pnlDelta))}>
                   {formatPln(pnlDelta)}
                 </div>
               </div>
               <div className="p-4">
                 <div className="text-xs text-muted-foreground">Outperformance</div>
-                <div className="metric-tabular mt-2 text-lg font-semibold text-primary">
-                  {((pnlDelta / humanPnl) * 100).toFixed(2)}%
+                <div className={cn("metric-tabular mt-2 text-lg font-semibold", colorForPnl(pnlDelta))}>
+                  {outperformance.toFixed(2)}%
                 </div>
               </div>
             </div>
@@ -1195,19 +1351,159 @@ function ContractsView() {
   );
 }
 
+function recommendationLabel(candidate: DecisionCandidate): string {
+  if (candidate.recommendation === "hold") {
+    return "HOLD";
+  }
+
+  return `${candidate.recommendation.toUpperCase()} ${formatMwh(
+    candidate.recommendedVolumeMwh
+  )}`;
+}
+
+function DecisionWorkbench() {
+  const scenario = useSimulationStore((state) => state.scenario);
+  const contracts = useSimulationStore((state) => state.contracts);
+  const trades = useSimulationStore((state) => state.trades);
+  const currentPeriod = useSimulationStore((state) => state.currentPeriod);
+  const setSelectedPeriod = useSimulationStore((state) => state.setSelectedPeriod);
+  const updateOrderDraft = useSimulationStore((state) => state.updateOrderDraft);
+  const candidates = useMemo(
+    () => buildDecisionCandidates(scenario, contracts, trades, currentPeriod, 12),
+    [scenario, contracts, trades, currentPeriod]
+  );
+  const bestCandidate = pickBestDecisionCandidate(candidates);
+
+  function loadCandidate(candidate: DecisionCandidate) {
+    if (!candidate.orderDraft) {
+      return;
+    }
+
+    setSelectedPeriod(candidate.periodIndex);
+    updateOrderDraft(candidate.orderDraft);
+  }
+
+  return (
+    <Card className="rounded-lg border-border/70 bg-card/80">
+      <CardHeader>
+        <CardTitle>Decision workbench</CardTitle>
+        <CardDescription>Next 12 periods by expected imbalance and RDB impact</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        {bestCandidate ? (
+          <div className="grid gap-3 rounded-md border border-[#2b4550] bg-muted/20 p-3 text-xs md:grid-cols-3">
+            <div>
+              <div className="text-muted-foreground">Best period</div>
+              <div className="metric-tabular mt-1 font-medium">{bestCandidate.label}</div>
+            </div>
+            <div>
+              <div className="text-muted-foreground">Recommendation</div>
+              <div
+                className={cn(
+                  "metric-tabular mt-1 font-medium",
+                  bestCandidate.recommendation === "buy" && "text-primary",
+                  bestCandidate.recommendation === "sell" && "text-[var(--energy-warning)]"
+                )}
+              >
+                {recommendationLabel(bestCandidate)}
+              </div>
+            </div>
+            <div>
+              <div className="text-muted-foreground">Expected impact</div>
+              <div
+                className={cn(
+                  "metric-tabular mt-1 font-medium",
+                  colorForPnl(bestCandidate.expectedPnlImpact)
+                )}
+              >
+                {formatPln(bestCandidate.expectedPnlImpact)}
+              </div>
+            </div>
+          </div>
+        ) : null}
+        <ScrollArea className="h-[294px]">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Period</TableHead>
+                <TableHead>Net</TableHead>
+                <TableHead>Imb. PnL</TableHead>
+                <TableHead>RDB</TableHead>
+                <TableHead>Decision</TableHead>
+                <TableHead>Impact</TableHead>
+                <TableHead />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {candidates.map((candidate) => (
+                <TableRow key={candidate.periodIndex}>
+                  <TableCell className="metric-tabular font-medium">{candidate.label}</TableCell>
+                  <TableCell className="metric-tabular">
+                    {formatSignedMwh(candidate.expectedNetMwh)}
+                  </TableCell>
+                  <TableCell
+                    className={cn("metric-tabular", colorForPnl(candidate.expectedImbalancePnl))}
+                  >
+                    {formatPln(candidate.expectedImbalancePnl)}
+                  </TableCell>
+                  <TableCell className="metric-tabular">
+                    {formatPrice(
+                      candidate.recommendation === "sell" ? candidate.rdbBid : candidate.rdbAsk
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    <Badge
+                      variant={candidate.recommendation === "hold" ? "outline" : "secondary"}
+                      className={cn(
+                        "h-5 rounded-md px-2 text-[11px]",
+                        candidate.recommendation === "buy" && "text-primary",
+                        candidate.recommendation === "sell" && "text-[var(--energy-warning)]"
+                      )}
+                    >
+                      {recommendationLabel(candidate)}
+                    </Badge>
+                  </TableCell>
+                  <TableCell
+                    className={cn("metric-tabular", colorForPnl(candidate.expectedPnlImpact))}
+                  >
+                    {formatPln(candidate.expectedPnlImpact)}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={!candidate.orderDraft}
+                      onClick={() => loadCandidate(candidate)}
+                    >
+                      Load
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </ScrollArea>
+      </CardContent>
+    </Card>
+  );
+}
+
 function MarketView() {
   const scenario = useSimulationStore((state) => state.scenario);
   const trades = useSimulationStore((state) => state.trades);
   const currentPeriod = useSimulationStore((state) => state.currentPeriod);
   const setSelectedPeriod = useSimulationStore((state) => state.setSelectedPeriod);
-  const periods = scenario.periods.slice(currentPeriod, currentPeriod + 24);
+  const periods = buildKnownMarketTape(scenario, currentPeriod).slice(
+    currentPeriod,
+    currentPeriod + 24
+  );
 
   return (
     <div className="grid flex-1 gap-4 p-4 md:p-6 xl:grid-cols-[minmax(0,1fr)_360px]">
       <Card className="rounded-lg border-border/70 bg-card/80">
         <CardHeader>
           <CardTitle>Intraday market board</CardTitle>
-          <CardDescription>RDB/SIDC-like simulated liquidity and balancing prices</CardDescription>
+          <CardDescription>Locked RDN reference plus RDB/SIDC executable liquidity</CardDescription>
         </CardHeader>
         <CardContent>
           <Table>
@@ -1225,9 +1521,9 @@ function MarketView() {
             </TableHeader>
             <TableBody>
               {periods.map((period) => (
-                <TableRow key={period.index}>
+                <TableRow key={period.periodIndex}>
                   <TableCell className="metric-tabular font-medium">{period.label}</TableCell>
-                  <TableCell className="metric-tabular">{formatPrice(period.spotPrice)}</TableCell>
+                  <TableCell className="metric-tabular">{formatPrice(period.rdnPrice)}</TableCell>
                   <TableCell className="metric-tabular text-[var(--energy-positive)]">
                     {formatPrice(period.intradayBid)}
                   </TableCell>
@@ -1235,19 +1531,24 @@ function MarketView() {
                     {formatPrice(period.intradayAsk)}
                   </TableCell>
                   <TableCell className="metric-tabular">
-                    {formatPrice(period.imbalanceLongPrice)}
+                    {formatPrice(
+                      period.actualImbalanceLongPrice ?? period.expectedImbalanceLongPrice
+                    )}
                   </TableCell>
                   <TableCell className="metric-tabular">
-                    {formatPrice(period.imbalanceShortPrice)}
+                    {formatPrice(
+                      period.actualImbalanceShortPrice ?? period.expectedImbalanceShortPrice
+                    )}
                   </TableCell>
                   <TableCell className="metric-tabular">{formatMwh(period.liquidityMwh)}</TableCell>
                   <TableCell>
                     <Button
                       variant="ghost"
                       size="sm"
-                      onClick={() => setSelectedPeriod(period.index)}
+                      disabled={period.periodIndex <= currentPeriod}
+                      onClick={() => setSelectedPeriod(period.periodIndex)}
                     >
-                      Trade
+                      {period.periodIndex <= currentPeriod ? "Locked" : "Trade"}
                     </Button>
                   </TableCell>
                 </TableRow>
@@ -1258,6 +1559,7 @@ function MarketView() {
       </Card>
       <div className="flex flex-col gap-4">
         <OrderTicket />
+        <DecisionWorkbench />
         <TradeTape trades={trades} />
       </div>
     </div>
@@ -1267,7 +1569,9 @@ function MarketView() {
 function ForecastView() {
   const scenario = useSimulationStore((state) => state.scenario);
   const currentPeriod = useSimulationStore((state) => state.currentPeriod);
-  const data = scenario.periods.slice(currentPeriod, currentPeriod + 48).map((period) => ({
+  const data = buildKnownMarketTape(scenario, currentPeriod)
+    .slice(currentPeriod, currentPeriod + 48)
+    .map((period) => ({
     label: period.label,
     forecastGeneration: period.forecastGeneration,
     actualGeneration: period.actualGeneration,
@@ -1357,13 +1661,31 @@ function DuelView() {
   const scenario = useSimulationStore((state) => state.scenario);
   const contracts = useSimulationStore((state) => state.contracts);
   const trades = useSimulationStore((state) => state.trades);
+  const currentPeriod = useSimulationStore((state) => state.currentPeriod);
   const botResult = useSimulationStore((state) => state.botResult);
   const runBotComparison = useSimulationStore((state) => state.runBotComparison);
   const human = useMemo(
-    () => settlePortfolio(scenario.periods, contracts, trades),
-    [scenario.periods, contracts, trades]
+    () => buildDashboardMetrics(scenario, contracts, trades, currentPeriod).projectedSettlement,
+    [scenario, contracts, trades, currentPeriod]
   );
-  const delta = botResult ? human.totalPnl - botResult.settlement.totalPnl : 0;
+  const manualRdbTrades = useMemo(
+    () => trades.filter((trade) => trade.market === "RDB" && trade.actor === "manual"),
+    [trades]
+  );
+  const scenarioSetupTrades = useMemo(() => getScenarioSetupTrades(trades), [trades]);
+  const botProjectedSettlement = useMemo(
+    () =>
+      botResult
+        ? buildDashboardMetrics(
+            scenario,
+            contracts,
+            [...scenarioSetupTrades, ...botResult.trades],
+            currentPeriod
+          ).projectedSettlement
+        : undefined,
+    [botResult, scenario, contracts, scenarioSetupTrades, currentPeriod]
+  );
+  const delta = botProjectedSettlement ? human.totalPnl - botProjectedSettlement.totalPnl : 0;
 
   return (
     <div className="grid flex-1 gap-4 p-4 md:p-6 xl:grid-cols-[minmax(0,1fr)_360px]">
@@ -1383,16 +1705,16 @@ function DuelView() {
             <MetricCard
               title="Manual projected"
               value={formatPln(human.totalPnl)}
-              description={`${trades.length} manual trades`}
+              description={`${manualRdbTrades.length} manual RDB trades`}
               icon={FileSignatureIcon}
               tone={pnlTone(human.totalPnl)}
             />
             <MetricCard
               title="Script projected"
-              value={botResult ? formatPln(botResult.settlement.totalPnl) : "Not run"}
+              value={botProjectedSettlement ? formatPln(botProjectedSettlement.totalPnl) : "Not run"}
               description={botResult ? `${botResult.trades.length} script trades` : "Use Run script"}
               icon={BotIcon}
-              tone={botResult ? pnlTone(botResult.settlement.totalPnl) : "neutral"}
+              tone={botProjectedSettlement ? pnlTone(botProjectedSettlement.totalPnl) : "neutral"}
             />
             <MetricCard
               title="Your edge"
@@ -1421,12 +1743,16 @@ function DuelView() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                <ComparisonRow label="Manual" settlement={human} tradeCount={trades.length} />
-                {botResult ? (
+                <ComparisonRow
+                  label="Manual"
+                  settlement={human}
+                  tradeCount={manualRdbTrades.length}
+                />
+                {botProjectedSettlement ? (
                   <ComparisonRow
                     label="Script"
-                    settlement={botResult.settlement}
-                    tradeCount={botResult.trades.length}
+                    settlement={botProjectedSettlement}
+                    tradeCount={botResult?.trades.length ?? 0}
                   />
                 ) : null}
               </TableBody>
@@ -1563,6 +1889,8 @@ function ReplayView() {
 }
 
 function TradeTape({ trades }: { trades: MarketTrade[] }) {
+  const rdbTrades = trades.filter((trade) => trade.market === "RDB");
+
   return (
     <Card className="rounded-lg border-border/70 bg-card/80">
       <CardHeader>
@@ -1570,13 +1898,13 @@ function TradeTape({ trades }: { trades: MarketTrade[] }) {
         <CardDescription>Accepted manual and script orders</CardDescription>
       </CardHeader>
       <CardContent>
-        {trades.length === 0 ? (
+        {rdbTrades.length === 0 ? (
           <div className="rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
             No RDB trades yet.
           </div>
         ) : (
           <div className="flex flex-col gap-2">
-            {trades.slice(-8).map((trade) => (
+            {rdbTrades.slice(-8).map((trade) => (
               <div
                 key={trade.id}
                 className="flex items-center justify-between gap-3 rounded-lg border border-border/70 bg-muted/30 p-3 text-sm"
@@ -1597,6 +1925,26 @@ function TradeTape({ trades }: { trades: MarketTrade[] }) {
       </CardContent>
     </Card>
   );
+}
+
+function SimulationTicker() {
+  const isRunning = useSimulationStore((state) => state.isRunning);
+  const speed = useSimulationStore((state) => state.speed);
+  const step = useSimulationStore((state) => state.step);
+
+  useEffect(() => {
+    if (!isRunning) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      step();
+    }, Math.max(250, 1400 / speed));
+
+    return () => window.clearInterval(intervalId);
+  }, [isRunning, speed, step]);
+
+  return null;
 }
 
 function ActiveView() {
@@ -1622,6 +1970,7 @@ function ActiveView() {
 export function GridBalancingApp() {
   return (
     <TradingShell>
+      <SimulationTicker />
       <motion.div
         className="flex min-h-0 flex-1 flex-col"
         initial={{ opacity: 0, y: 8 }}

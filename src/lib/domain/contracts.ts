@@ -163,7 +163,7 @@ export function evaluateContractPrice(contract: Contract, period: PeriodSnapshot
     return formula.plnPerMwh;
   }
 
-  return period.spotPrice + formula.premium;
+  return period.rdnPrice + formula.premium;
 }
 
 export function settleContractsForPeriod(

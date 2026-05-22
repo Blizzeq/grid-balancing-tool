@@ -9,6 +9,11 @@ import type {
   TradeSettlement,
 } from "./types";
 
+interface SettlementPriceOverride {
+  imbalanceLongPrice?: number;
+  imbalanceShortPrice?: number;
+}
+
 function round(value: number, precision = 2): number {
   return Number(value.toFixed(precision));
 }
@@ -52,21 +57,25 @@ export function settleTradesForPeriod(
 export function settlePeriod(
   period: PeriodSnapshot,
   contracts: Contract[],
-  trades: MarketTrade[]
+  trades: MarketTrade[],
+  basis: "forecast" | "actual" = "actual",
+  priceOverride: SettlementPriceOverride = {}
 ): PeriodSettlement {
-  const contractSettlement = settleContractsForPeriod(period, contracts, "actual");
+  const contractSettlement = settleContractsForPeriod(period, contracts, basis);
   const tradeSettlement = settleTradesForPeriod(period.index, trades);
   const boughtMwh = contractSettlement.boughtMwh + tradeSettlement.boughtMwh;
   const soldMwh = contractSettlement.soldMwh + tradeSettlement.soldMwh;
   const contractedPosition = contractSettlement.boughtMwh - contractSettlement.soldMwh;
   const marketPosition = tradeSettlement.boughtMwh - tradeSettlement.soldMwh;
   const imbalanceMwh = boughtMwh - soldMwh;
+  const imbalanceLongPrice = priceOverride.imbalanceLongPrice ?? period.imbalanceLongPrice;
+  const imbalanceShortPrice = priceOverride.imbalanceShortPrice ?? period.imbalanceShortPrice;
   const imbalancePrice =
-    imbalanceMwh >= 0 ? period.imbalanceLongPrice : period.imbalanceShortPrice;
+    imbalanceMwh >= 0 ? imbalanceLongPrice : imbalanceShortPrice;
   const imbalancePnl =
     imbalanceMwh >= 0
-      ? imbalanceMwh * period.imbalanceLongPrice
-      : -Math.abs(imbalanceMwh) * period.imbalanceShortPrice;
+      ? imbalanceMwh * imbalanceLongPrice
+      : -Math.abs(imbalanceMwh) * imbalanceShortPrice;
   const periodPnl = contractSettlement.pnl + tradeSettlement.pnl + imbalancePnl;
 
   return {
@@ -92,9 +101,14 @@ export function settlePeriod(
 export function settlePortfolio(
   periods: PeriodSnapshot[],
   contracts: Contract[],
-  trades: MarketTrade[]
+  trades: MarketTrade[],
+  basis: "forecast" | "actual" = "actual"
 ): PortfolioSettlement {
-  const settlements = periods.map((period) => settlePeriod(period, contracts, trades));
+  const settlements = periods.map((period) => settlePeriod(period, contracts, trades, basis));
+  return aggregateSettlements(settlements);
+}
+
+export function aggregateSettlements(settlements: PeriodSettlement[]): PortfolioSettlement {
   const totals = settlements.reduce(
     (accumulator, settlement) => {
       accumulator.totalPnl += settlement.periodPnl;

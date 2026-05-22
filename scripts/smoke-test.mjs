@@ -21,9 +21,16 @@ page.on("console", (message) => {
 });
 
 await page.goto(url, { waitUntil: "networkidle" });
+await page.getByRole("button", { name: /Play simulation/ }).click();
+await page.getByRole("button", { name: /Pause simulation/ }).click();
+await page.getByRole("button", { name: /Step/ }).click();
 await page.getByRole("button", { name: /Place (Buy|Sell) Order/ }).click();
 await page.getByRole("button", { name: /^Market$/ }).click();
-await page.getByText(/BUY 25\.0 MWh/).waitFor({ timeout: 5000 });
+await page.getByText("Decision workbench").waitFor({ timeout: 5000 });
+await page.locator('button:has-text("Load"):not([disabled])').first().click();
+await page.getByText(/^BUY .+ MWh$/).waitFor({ timeout: 5000 });
+await page.getByRole("button", { name: /Run to end/ }).click();
+await page.getByText(/CLOSED/).waitFor({ timeout: 5000 });
 await page.getByRole("button", { name: /Strategy Duel/ }).click();
 await page.getByRole("button", { name: /Run script/ }).click();
 await page.getByText(/Run complete/).waitFor({ timeout: 5000 });

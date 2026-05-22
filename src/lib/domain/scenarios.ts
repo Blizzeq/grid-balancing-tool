@@ -73,12 +73,12 @@ interface ScenarioTuning {
 
 const SCENARIO_TUNING: Record<ScenarioId, ScenarioTuning> = {
   "sunny-negative": {
-    pvScale: 1.45,
+    pvScale: 1.62,
     windScale: 0.9,
-    loadScale: 0.95,
+    loadScale: 0.92,
     volatility: 0.7,
-    priceShift: -20,
-    middayPriceDip: 210,
+    priceShift: -70,
+    middayPriceDip: 350,
     eveningScarcity: 75,
   },
   "wind-drop": {
@@ -248,6 +248,7 @@ function createPeriod(
     eveningScarcity +
     outagePremium +
     (rng() - 0.5) * 45 * tuning.volatility;
+  const rdnPrice = round(spotPrice, 2);
 
   const spread = clamp(
     12 + tuning.volatility * 11 + Math.abs(spotPrice - 320) * 0.018,
@@ -265,7 +266,8 @@ function createPeriod(
     actualGeneration: round(Math.max(pvActual + windActual, 0)),
     forecastLoad: round(Math.max(forecastLoad, 0)),
     actualLoad: round(Math.max(actualLoad, 0)),
-    spotPrice: round(spotPrice, 2),
+    rdnPrice,
+    spotPrice: rdnPrice,
     intradayBid: round(spotPrice - spread / 2, 2),
     intradayAsk: round(spotPrice + spread / 2, 2),
     imbalanceLongPrice: round(spotPrice - longDiscount, 2),
@@ -291,7 +293,17 @@ export function createScenario(id: ScenarioId = "sunny-negative"): Scenario {
     createPeriod(definition, tuning, index, rng)
   );
 
-  return { definition, periods };
+  return {
+    definition,
+    metadata: {
+      source: "synthetic-calibrated",
+      seed: definition.seed,
+      deliveryDate: "2025-05-13",
+      marketArea: "PL Market",
+      generatedAtLabel: "2025-05-12 14:30",
+    },
+    periods,
+  };
 }
 
 export function getScenarioDefinition(id: ScenarioId): ScenarioDefinition {

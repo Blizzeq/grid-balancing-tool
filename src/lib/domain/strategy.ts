@@ -1,8 +1,9 @@
 import { settleContractsForPeriod } from "./contracts";
-import { executeOrder } from "./markets";
+import { buildDayAheadAuctionTrades, buildKnownPeriodView, executeOrder } from "./markets";
 import { settlePortfolio, settleTradesForPeriod } from "./settlement";
 import type {
   Contract,
+  KnownPeriodView,
   MarketTrade,
   OrderDraft,
   PeriodSnapshot,
@@ -28,6 +29,7 @@ export interface StrategyRunResult {
 
 function createRecommendedOrder(
   period: PeriodSnapshot,
+  knownPeriod: KnownPeriodView,
   contracts: Contract[],
   existingTrades: MarketTrade[],
   currentPeriod: number,
@@ -61,7 +63,8 @@ function createRecommendedOrder(
 
   if (expectedNet > 0) {
     const shouldSell =
-      period.intradayBid > period.imbalanceLongPrice + config.transactionCostPlnMwh;
+      knownPeriod.intradayBid >
+      knownPeriod.expectedImbalanceLongPrice + config.transactionCostPlnMwh;
 
     if (!shouldSell) {
       return null;
@@ -70,14 +73,15 @@ function createRecommendedOrder(
     return {
       side: "sell",
       market: "RDB",
-      periodIndex: period.index,
+      periodIndex: knownPeriod.periodIndex,
       volumeMwh: closeVolume,
-      limitPrice: period.intradayBid - 8,
+      limitPrice: knownPeriod.intradayBid - 8,
     };
   }
 
   const shouldBuy =
-    period.intradayAsk < period.imbalanceShortPrice - config.transactionCostPlnMwh;
+    knownPeriod.intradayAsk <
+    knownPeriod.expectedImbalanceShortPrice - config.transactionCostPlnMwh;
 
   if (!shouldBuy) {
     return null;
@@ -86,19 +90,21 @@ function createRecommendedOrder(
   return {
     side: "buy",
     market: "RDB",
-    periodIndex: period.index,
+    periodIndex: knownPeriod.periodIndex,
     volumeMwh: closeVolume,
-    limitPrice: period.intradayAsk + 8,
+    limitPrice: knownPeriod.intradayAsk + 8,
   };
 }
 
 export function runAutopilot(
   scenario: Scenario,
   contracts: Contract[],
-  config: StrategyConfig = DEFAULT_STRATEGY_CONFIG
+  config: StrategyConfig = DEFAULT_STRATEGY_CONFIG,
+  initialTrades: MarketTrade[] = buildDayAheadAuctionTrades(scenario, contracts)
 ): StrategyRunResult {
-  const trades: MarketTrade[] = [];
-  const doNothing = settlePortfolio(scenario.periods, contracts, []);
+  const scriptTrades: MarketTrade[] = [];
+  const settlementTrades: MarketTrade[] = [...initialTrades];
+  const doNothing = settlePortfolio(scenario.periods, contracts, settlementTrades);
 
   for (let currentPeriod = 0; currentPeriod < scenario.periods.length; currentPeriod += 1) {
     const horizonEnd = Math.min(
@@ -112,10 +118,12 @@ export function runAutopilot(
       targetPeriod += 1
     ) {
       const period = scenario.periods[targetPeriod];
+      const knownPeriod = buildKnownPeriodView(scenario, currentPeriod, targetPeriod);
       const order = createRecommendedOrder(
         period,
+        knownPeriod,
         contracts,
-        trades,
+        settlementTrades,
         currentPeriod,
         config
       );
@@ -124,18 +132,25 @@ export function runAutopilot(
         continue;
       }
 
-      const execution = executeOrder(order, period, currentPeriod, "script", trades.length);
+      const execution = executeOrder(
+        order,
+        period,
+        currentPeriod,
+        "script",
+        scriptTrades.length
+      );
 
       if (execution.trade) {
-        trades.push(execution.trade);
+        scriptTrades.push(execution.trade);
+        settlementTrades.push(execution.trade);
       }
     }
   }
 
-  const settlement = settlePortfolio(scenario.periods, contracts, trades);
+  const settlement = settlePortfolio(scenario.periods, contracts, settlementTrades);
 
   return {
-    trades,
+    trades: scriptTrades,
     settlement,
     avoidedImbalanceMwh:
       doNothing.totalImbalanceAbsMwh - settlement.totalImbalanceAbsMwh,

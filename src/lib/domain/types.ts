@@ -14,7 +14,7 @@ export type ScenarioId = z.infer<typeof scenarioIdSchema>;
 export type ContractSide = "buy" | "sell";
 export type ContractGranularity = "15m" | "hourly" | "block";
 export type MarketKind = "RDN" | "RDB";
-export type TradeActor = "manual" | "script";
+export type TradeActor = "manual" | "script" | "scenario";
 export type TradeSide = "buy" | "sell";
 export type GameMode = "manual" | "manual-with-advice" | "autopilot" | "replay";
 
@@ -33,6 +33,7 @@ export interface PeriodSnapshot {
   actualGeneration: number;
   forecastLoad: number;
   actualLoad: number;
+  rdnPrice: number;
   spotPrice: number;
   intradayBid: number;
   intradayAsk: number;
@@ -51,9 +52,51 @@ export interface ScenarioDefinition {
   difficulty: "training" | "standard" | "hard";
 }
 
+export interface ScenarioMetadata {
+  source: "synthetic-calibrated";
+  seed: number;
+  deliveryDate: string;
+  marketArea: string;
+  generatedAtLabel: string;
+}
+
 export interface Scenario {
   definition: ScenarioDefinition;
+  metadata: ScenarioMetadata;
   periods: PeriodSnapshot[];
+}
+
+export interface KnownPeriodView {
+  periodIndex: number;
+  label: string;
+  hour: number;
+  forecastGeneration: number;
+  forecastLoad: number;
+  actualGeneration: number | null;
+  actualLoad: number | null;
+  rdnPrice: number;
+  intradayBid: number;
+  intradayAsk: number;
+  liquidityMwh: number;
+  expectedImbalanceLongPrice: number;
+  expectedImbalanceShortPrice: number;
+  actualImbalanceLongPrice: number | null;
+  actualImbalanceShortPrice: number | null;
+  isSettled: boolean;
+  weather: WeatherPoint;
+}
+
+export interface ScenarioCalibrationReport {
+  scenarioId: ScenarioId;
+  averageRdnPrice: number;
+  rdnPriceStdDev: number;
+  minRdnPrice: number;
+  maxRdnPrice: number;
+  negativeRdnPeriods: number;
+  minBidAskSpread: number;
+  maxBidAskSpread: number;
+  averageLiquidityMwh: number;
+  priceSpikeThreshold: number;
 }
 
 export type VolumeFormula =
@@ -201,4 +244,63 @@ export interface StrategyConfig {
   transactionCostPlnMwh: number;
   reactionDelayPeriods: number;
   aggressiveness: number;
+}
+
+export interface SimulationClockState {
+  currentPeriod: number;
+  isRunning: boolean;
+  speed: number;
+  isClosed: boolean;
+}
+
+export interface RiskAlert {
+  id: string;
+  title: string;
+  description: string;
+  timeLabel: string;
+  tone: "danger" | "warning" | "info";
+}
+
+export interface PnlWaterfallEntry {
+  name: string;
+  value: number;
+  kind: "component" | "total";
+}
+
+export interface DashboardSeriesPoint {
+  label: string;
+  actual?: number | null;
+  forecast?: number | null;
+  portfolio?: number | null;
+  projected?: number | null;
+  upper?: number;
+  lower?: number;
+}
+
+export interface SignedContractMetric {
+  id: string;
+  counterparty: string;
+  product: string;
+  deliveryPeriod: string;
+  volumeMwh: number;
+  pricePlnMwh: number;
+  status: "Active" | "Expired";
+  mtmPln: number;
+}
+
+export interface DashboardMetrics {
+  maxPositionLimitMwh: number;
+  currentPositionMwh: number;
+  currentContractedMwh: number;
+  currentMarketMwh: number;
+  currentImbalanceMwh: number;
+  realizedSettlement: PortfolioSettlement;
+  projectedSettlement: PortfolioSettlement;
+  fullActualSettlement: PortfolioSettlement;
+  balanceSeries: DashboardSeriesPoint[];
+  loadSeries: DashboardSeriesPoint[];
+  generationSeries: DashboardSeriesPoint[];
+  pnlWaterfall: PnlWaterfallEntry[];
+  riskAlerts: RiskAlert[];
+  signedContracts: SignedContractMetric[];
 }
