@@ -3,7 +3,12 @@
 import { create } from "zustand";
 
 import { CONTRACT_TEMPLATES, createContractFromTemplate, createDefaultContracts } from "../domain/contracts";
-import { buildDayAheadAuctionTrades, executeOrder, getScenarioSetupTrades } from "../domain/markets";
+import {
+  buildDecisionLogEntry,
+  buildOrderImpactPreview,
+  type DecisionLogEntry,
+} from "../domain/decisions";
+import { buildDayAheadAuctionTrades, getScenarioSetupTrades } from "../domain/markets";
 import { getTradablePeriods } from "../domain/metrics";
 import { createScenario } from "../domain/scenarios";
 import { runAutopilot, type StrategyRunResult } from "../domain/strategy";
@@ -31,6 +36,7 @@ interface SimulationStore {
   selectedPeriod: number;
   contracts: Contract[];
   trades: MarketTrade[];
+  decisionLog: DecisionLogEntry[];
   orderDraft: OrderDraft;
   statusMessage: string;
   botResult?: StrategyRunResult;
@@ -89,6 +95,7 @@ function buildInitialState(scenarioId: ScenarioId = "sunny-negative") {
     selectedPeriod,
     contracts,
     trades: buildDayAheadAuctionTrades(scenario, contracts),
+    decisionLog: [],
     orderDraft: buildInitialOrderDraft(scenario, selectedPeriod),
     statusMessage: "Trading day opened. D-1 RDN setup is locked; RDB/SIDC is available.",
     botResult: undefined,
@@ -166,26 +173,37 @@ export const useSimulationStore = create<SimulationStore>((set, get) => ({
       return;
     }
 
-    const execution = executeOrder(
-      state.orderDraft,
-      period,
+    const preview = buildOrderImpactPreview(
+      state.scenario,
+      state.contracts,
+      state.trades,
       state.currentPeriod,
-      "manual",
-      state.trades.length
+      state.orderDraft
+    );
+    const decisionLogEntry = buildDecisionLogEntry(
+      preview,
+      state.scenario.periods[state.currentPeriod]?.label ?? "00:00",
+      state.decisionLog.length
     );
 
-    if (!execution.trade) {
-      set({ statusMessage: execution.reason });
+    if (!preview.trade) {
+      set({
+        decisionLog: [decisionLogEntry, ...state.decisionLog],
+        statusMessage: preview.reason,
+      });
       return;
     }
 
     set({
-      trades: [...state.trades, execution.trade],
-      statusMessage: `${execution.trade.side.toUpperCase()} ${execution.trade.volumeMwh.toFixed(
+      trades: [...state.trades, preview.trade],
+      decisionLog: [decisionLogEntry, ...state.decisionLog],
+      statusMessage: `${preview.trade.side.toUpperCase()} ${preview.trade.volumeMwh.toFixed(
         1
-      )} MWh for ${period.label} matched at ${execution.trade.pricePlnMwh.toFixed(
+      )} MWh for ${period.label} matched at ${preview.trade.pricePlnMwh.toFixed(
         0
-      )} PLN/MWh.`,
+      )} PLN/MWh. ${decisionLogEntry.title}: ${preview.pnlImpact.toFixed(
+        0
+      )} PLN, risk cut ${Math.max(preview.imbalanceReductionMwh, 0).toFixed(1)} MWh.`,
       botResult: undefined,
     });
   },

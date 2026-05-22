@@ -28,6 +28,52 @@ export interface OrderImpactPreview {
   pnlImpact: number;
   imbalanceReductionMwh: number;
   executionPrice?: number;
+  trade?: MarketTrade;
+}
+
+export interface DecisionLogEntry {
+  id: string;
+  periodIndex: number;
+  label: string;
+  side: TradeSide;
+  volumeMwh: number;
+  limitPrice: number;
+  accepted: boolean;
+  title: string;
+  summary: string;
+  reason: string;
+  pnlImpact: number;
+  imbalanceReductionMwh: number;
+  beforeImbalanceMwh: number;
+  afterImbalanceMwh: number;
+  priceQuality: "good" | "fair" | "poor" | "rejected";
+  exposureChange: "reduced" | "increased" | "unchanged";
+  tone: "positive" | "warning" | "negative" | "neutral";
+  createdAtLabel: string;
+}
+
+export interface StrategyDuelInsight {
+  id: string;
+  periodIndex: number;
+  label: string;
+  category: "missed-trade" | "wrong-side" | "too-late" | "too-much-volume";
+  title: string;
+  description: string;
+  manualPnl: number;
+  scriptPnl: number;
+  opportunityPln: number;
+}
+
+export interface ScenarioDecisionReport {
+  acceptedDecisionCount: number;
+  rejectedDecisionCount: number;
+  totalDecisionPnlImpact: number;
+  totalRiskCutMwh: number;
+  avoidableImbalanceCost: number;
+  totalPnlGapToScript: number;
+  missedOpportunityCount: number;
+  bestDecision?: DecisionLogEntry;
+  worstDecision?: DecisionLogEntry;
 }
 
 export interface DecisionCandidate {
@@ -139,6 +185,98 @@ export function buildOrderImpactPreview(
     pnlImpact: round(after.periodPnl - before.periodPnl),
     imbalanceReductionMwh: round(Math.abs(before.imbalanceMwh) - Math.abs(after.imbalanceMwh)),
     executionPrice: execution.trade.pricePlnMwh,
+    trade: execution.trade,
+  };
+}
+
+function titleForDecision(preview: OrderImpactPreview): string {
+  if (!preview.accepted) {
+    return "Order rejected";
+  }
+
+  if (preview.pnlImpact > 0 && preview.imbalanceReductionMwh > 0) {
+    return "Good hedge";
+  }
+
+  if (preview.imbalanceReductionMwh > 0) {
+    return "Risk cut, paid premium";
+  }
+
+  if (preview.imbalanceReductionMwh < 0) {
+    return "Added imbalance risk";
+  }
+
+  return "Neutral execution";
+}
+
+function priceQualityFor(preview: OrderImpactPreview): DecisionLogEntry["priceQuality"] {
+  if (!preview.accepted) {
+    return "rejected";
+  }
+
+  if (preview.pnlImpact > 0 && preview.imbalanceReductionMwh > 0) {
+    return "good";
+  }
+
+  if (preview.imbalanceReductionMwh > 0) {
+    return "fair";
+  }
+
+  return "poor";
+}
+
+function toneForDecision(preview: OrderImpactPreview): DecisionLogEntry["tone"] {
+  if (!preview.accepted || preview.imbalanceReductionMwh < 0) {
+    return "negative";
+  }
+
+  if (preview.pnlImpact > 0 && preview.imbalanceReductionMwh > 0) {
+    return "positive";
+  }
+
+  if (preview.imbalanceReductionMwh > 0) {
+    return "warning";
+  }
+
+  return "neutral";
+}
+
+export function buildDecisionLogEntry(
+  preview: OrderImpactPreview,
+  submittedAtLabel: string,
+  count: number
+): DecisionLogEntry {
+  const exposureChange =
+    preview.imbalanceReductionMwh > 0
+      ? "reduced"
+      : preview.imbalanceReductionMwh < 0
+        ? "increased"
+        : "unchanged";
+
+  return {
+    id: `decision-${count + 1}`,
+    periodIndex: preview.periodIndex,
+    label: preview.label,
+    side: preview.side,
+    volumeMwh: round(preview.volumeMwh, 1),
+    limitPrice: round(preview.limitPrice),
+    accepted: preview.accepted,
+    title: titleForDecision(preview),
+    summary: preview.accepted
+      ? `${preview.side.toUpperCase()} ${round(preview.volumeMwh, 1)} MWh moved expected imbalance from ${round(
+          preview.beforeImbalanceMwh,
+          1
+        )} to ${round(preview.afterImbalanceMwh, 1)} MWh.`
+      : preview.reason,
+    reason: preview.reason,
+    pnlImpact: preview.pnlImpact,
+    imbalanceReductionMwh: preview.imbalanceReductionMwh,
+    beforeImbalanceMwh: preview.beforeImbalanceMwh,
+    afterImbalanceMwh: preview.afterImbalanceMwh,
+    priceQuality: priceQualityFor(preview),
+    exposureChange,
+    tone: toneForDecision(preview),
+    createdAtLabel: submittedAtLabel,
   };
 }
 
@@ -261,4 +399,197 @@ export function pickBestDecisionCandidate(candidates: DecisionCandidate[]) {
       )[0] ??
     candidates[0]
   );
+}
+
+interface AggregatedPeriodTrades {
+  periodIndex: number;
+  volumeMwh: number;
+  averagePrice: number;
+  side?: TradeSide;
+  submittedAtPeriod?: number;
+}
+
+function aggregateRdbTradesByPeriod(trades: MarketTrade[]) {
+  return trades
+    .filter((trade) => trade.market === "RDB" && trade.accepted)
+    .reduce<Map<number, AggregatedPeriodTrades>>((map, trade) => {
+      const existing = map.get(trade.periodIndex);
+      const existingVolume = existing?.volumeMwh ?? 0;
+      const volumeMwh = existingVolume + trade.volumeMwh;
+      const weightedPrice =
+        ((existing?.averagePrice ?? 0) * existingVolume +
+          trade.pricePlnMwh * trade.volumeMwh) /
+        volumeMwh;
+
+      map.set(trade.periodIndex, {
+        periodIndex: trade.periodIndex,
+        volumeMwh,
+        averagePrice: round(weightedPrice),
+        side: existing?.side && existing.side !== trade.side ? undefined : trade.side,
+        submittedAtPeriod:
+          existing?.submittedAtPeriod === undefined
+            ? trade.submittedAtPeriod
+            : Math.min(existing.submittedAtPeriod, trade.submittedAtPeriod),
+      });
+
+      return map;
+    }, new Map());
+}
+
+function insightCategory(
+  manual?: AggregatedPeriodTrades,
+  script?: AggregatedPeriodTrades
+): StrategyDuelInsight["category"] {
+  if (!manual || !script) {
+    return "missed-trade";
+  }
+
+  if (manual.side && script.side && manual.side !== script.side) {
+    return "wrong-side";
+  }
+
+  if (
+    manual.submittedAtPeriod !== undefined &&
+    script.submittedAtPeriod !== undefined &&
+    manual.submittedAtPeriod > script.submittedAtPeriod + 1
+  ) {
+    return "too-late";
+  }
+
+  if (manual.volumeMwh > script.volumeMwh * 1.35) {
+    return "too-much-volume";
+  }
+
+  return "missed-trade";
+}
+
+function insightCopy(
+  category: StrategyDuelInsight["category"],
+  manual?: AggregatedPeriodTrades,
+  script?: AggregatedPeriodTrades
+) {
+  if (category === "wrong-side") {
+    return {
+      title: "Wrong side",
+      description: `Manual ${manual?.side ?? "mixed"} vs script ${script?.side ?? "mixed"} in the same delivery period.`,
+    };
+  }
+
+  if (category === "too-late") {
+    return {
+      title: "Too late",
+      description: "The script closed the exposure earlier before gate-closure pressure increased.",
+    };
+  }
+
+  if (category === "too-much-volume") {
+    return {
+      title: "Too much volume",
+      description: "Manual volume overshot the script hedge and left more PnL leakage.",
+    };
+  }
+
+  return {
+    title: "Missed trade",
+    description: script
+      ? `Script traded ${round(script.volumeMwh, 1)} MWh while manual left the period unmanaged.`
+      : "Manual book leaked PnL in a period the script handled better.",
+  };
+}
+
+export function buildStrategyDuelInsights(
+  scenario: Scenario,
+  contracts: Contract[],
+  manualTrades: MarketTrade[],
+  scriptTrades: MarketTrade[],
+  currentPeriod: number,
+  limit = 8
+): StrategyDuelInsight[] {
+  const setupTrades = manualTrades.filter(
+    (trade) => trade.actor === "scenario" && trade.market === "RDN"
+  );
+  const manualByPeriod = aggregateRdbTradesByPeriod(
+    manualTrades.filter((trade) => trade.actor === "manual")
+  );
+  const scriptByPeriod = aggregateRdbTradesByPeriod(scriptTrades);
+  const candidatePeriods = new Set<number>([
+    ...Array.from(manualByPeriod.keys()),
+    ...Array.from(scriptByPeriod.keys()),
+  ]);
+
+  return Array.from(candidatePeriods)
+    .map((periodIndex) => {
+      const manualPeriodTrades = manualTrades.filter(
+        (trade) =>
+          trade.periodIndex === periodIndex && trade.market === "RDB" && trade.actor === "manual"
+      );
+      const scriptPeriodTrades = scriptTrades.filter(
+        (trade) => trade.periodIndex === periodIndex && trade.market === "RDB"
+      );
+      const manualSettlement = buildExpectedSettlement(
+        scenario,
+        contracts,
+        [...setupTrades, ...manualPeriodTrades],
+        currentPeriod,
+        periodIndex
+      );
+      const scriptSettlement = buildExpectedSettlement(
+        scenario,
+        contracts,
+        [...setupTrades, ...scriptPeriodTrades],
+        currentPeriod,
+        periodIndex
+      );
+      const opportunityPln = round(scriptSettlement.periodPnl - manualSettlement.periodPnl);
+      const manual = manualByPeriod.get(periodIndex);
+      const script = scriptByPeriod.get(periodIndex);
+      const category = insightCategory(manual, script);
+      const copy = insightCopy(category, manual, script);
+
+      return {
+        id: `duel-${periodIndex}`,
+        periodIndex,
+        label: scenario.periods[periodIndex]?.label ?? `${periodIndex + 1}`,
+        category,
+        title: copy.title,
+        description: copy.description,
+        manualPnl: manualSettlement.periodPnl,
+        scriptPnl: scriptSettlement.periodPnl,
+        opportunityPln,
+      };
+    })
+    .filter((insight) => insight.opportunityPln > 50)
+    .sort((left, right) => right.opportunityPln - left.opportunityPln)
+    .slice(0, limit);
+}
+
+export function buildScenarioDecisionReport(
+  decisionLog: DecisionLogEntry[],
+  insights: StrategyDuelInsight[],
+  manualSettlement: { totalPnl: number; imbalancePnl: number },
+  scriptSettlement?: { totalPnl: number; imbalancePnl: number }
+): ScenarioDecisionReport {
+  const accepted = decisionLog.filter((entry) => entry.accepted);
+  const rejected = decisionLog.filter((entry) => !entry.accepted);
+  const sortedByImpact = [...accepted].sort((left, right) => left.pnlImpact - right.pnlImpact);
+
+  return {
+    acceptedDecisionCount: accepted.length,
+    rejectedDecisionCount: rejected.length,
+    totalDecisionPnlImpact: round(
+      accepted.reduce((sum, entry) => sum + entry.pnlImpact, 0)
+    ),
+    totalRiskCutMwh: round(
+      accepted.reduce((sum, entry) => sum + Math.max(entry.imbalanceReductionMwh, 0), 0)
+    ),
+    avoidableImbalanceCost: scriptSettlement
+      ? round(Math.max(scriptSettlement.imbalancePnl - manualSettlement.imbalancePnl, 0))
+      : 0,
+    totalPnlGapToScript: scriptSettlement
+      ? round(scriptSettlement.totalPnl - manualSettlement.totalPnl)
+      : 0,
+    missedOpportunityCount: insights.length,
+    bestDecision: sortedByImpact.at(-1),
+    worstDecision: sortedByImpact[0],
+  };
 }

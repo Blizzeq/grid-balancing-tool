@@ -69,8 +69,13 @@ import { CONTRACT_TEMPLATES } from "@/lib/domain/contracts";
 import {
   buildDecisionCandidates,
   buildOrderImpactPreview,
+  buildScenarioDecisionReport,
+  buildStrategyDuelInsights,
   pickBestDecisionCandidate,
+  type DecisionLogEntry,
   type DecisionCandidate,
+  type ScenarioDecisionReport,
+  type StrategyDuelInsight,
 } from "@/lib/domain/decisions";
 import { formatMwh, formatPln, formatPrice, pnlTone } from "@/lib/domain/format";
 import { buildDashboardMetrics, getTradablePeriods } from "@/lib/domain/metrics";
@@ -1361,6 +1366,255 @@ function recommendationLabel(candidate: DecisionCandidate): string {
   )}`;
 }
 
+function decisionToneClass(tone: DecisionLogEntry["tone"]): string {
+  if (tone === "positive") {
+    return "text-[var(--energy-positive)]";
+  }
+
+  if (tone === "warning") {
+    return "text-[var(--energy-warning)]";
+  }
+
+  if (tone === "negative") {
+    return "text-[var(--energy-negative)]";
+  }
+
+  return "text-muted-foreground";
+}
+
+function insightCategoryLabel(category: StrategyDuelInsight["category"]): string {
+  if (category === "wrong-side") {
+    return "Wrong side";
+  }
+
+  if (category === "too-late") {
+    return "Too late";
+  }
+
+  if (category === "too-much-volume") {
+    return "Too much volume";
+  }
+
+  return "Missed trade";
+}
+
+function decisionSummary(entry?: DecisionLogEntry): string {
+  if (!entry) {
+    return "n/a";
+  }
+
+  return `${entry.label} | ${entry.side.toUpperCase()} ${formatMwh(
+    entry.volumeMwh
+  )} | ${formatPln(entry.pnlImpact)}`;
+}
+
+function DecisionLogPanel({ decisionLog }: { decisionLog: DecisionLogEntry[] }) {
+  const entries = decisionLog.slice(0, 6);
+
+  return (
+    <Card className="rounded-lg border-border/70 bg-card/80">
+      <CardHeader>
+        <CardTitle>Decision log</CardTitle>
+        <CardDescription>Post-trade feedback for manual RDB decisions</CardDescription>
+      </CardHeader>
+      <CardContent>
+        {entries.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
+            No manual decisions yet.
+          </div>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {entries.map((entry) => (
+              <div
+                key={entry.id}
+                className="rounded-lg border border-border/70 bg-muted/30 p-3 text-xs"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className={cn("font-medium", decisionToneClass(entry.tone))}>
+                      {entry.title}
+                    </div>
+                    <div className="mt-1 text-muted-foreground">{entry.summary}</div>
+                  </div>
+                  <div className="metric-tabular shrink-0 text-muted-foreground">
+                    {entry.createdAtLabel}
+                  </div>
+                </div>
+                <div className="mt-3 grid grid-cols-3 gap-2 border-t border-border/70 pt-2">
+                  <div>
+                    <div className="text-muted-foreground">Impact</div>
+                    <div className={cn("metric-tabular font-medium", colorForPnl(entry.pnlImpact))}>
+                      {formatPln(entry.pnlImpact)}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-muted-foreground">Risk cut</div>
+                    <div
+                      className={cn(
+                        "metric-tabular font-medium",
+                        entry.imbalanceReductionMwh > 0
+                          ? "text-[var(--energy-positive)]"
+                          : entry.imbalanceReductionMwh < 0
+                            ? "text-[var(--energy-negative)]"
+                            : "text-muted-foreground"
+                      )}
+                    >
+                      {formatSignedMwh(entry.imbalanceReductionMwh)}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-muted-foreground">Price</div>
+                    <div className="font-medium capitalize">{entry.priceQuality}</div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function DuelInsightsTable({
+  insights,
+  hasBotResult,
+}: {
+  insights: StrategyDuelInsight[];
+  hasBotResult: boolean;
+}) {
+  return (
+    <Card className="rounded-lg border-border/70 bg-card/80">
+      <CardHeader>
+        <CardTitle>Bot edge diagnostics</CardTitle>
+        <CardDescription>Periods where the script found better RDB action</CardDescription>
+      </CardHeader>
+      <CardContent>
+        {!hasBotResult ? (
+          <div className="rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
+            Run script to populate diagnostics.
+          </div>
+        ) : insights.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
+            No material bot edge found for the current manual book.
+          </div>
+        ) : (
+          <ScrollArea className="h-[304px]">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Period</TableHead>
+                  <TableHead>Finding</TableHead>
+                  <TableHead>Manual PnL</TableHead>
+                  <TableHead>Script PnL</TableHead>
+                  <TableHead>Opportunity</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {insights.map((insight) => (
+                  <TableRow key={insight.id}>
+                    <TableCell className="metric-tabular font-medium">{insight.label}</TableCell>
+                    <TableCell>
+                      <div className="font-medium">{insightCategoryLabel(insight.category)}</div>
+                      <div className="max-w-[260px] text-xs text-muted-foreground">
+                        {insight.description}
+                      </div>
+                    </TableCell>
+                    <TableCell className={cn("metric-tabular", colorForPnl(insight.manualPnl))}>
+                      {formatPln(insight.manualPnl)}
+                    </TableCell>
+                    <TableCell className={cn("metric-tabular", colorForPnl(insight.scriptPnl))}>
+                      {formatPln(insight.scriptPnl)}
+                    </TableCell>
+                    <TableCell className="metric-tabular text-[var(--energy-positive)]">
+                      {formatPln(insight.opportunityPln)}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </ScrollArea>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function ScenarioReportCard({
+  report,
+  hasBotResult,
+}: {
+  report: ScenarioDecisionReport;
+  hasBotResult: boolean;
+}) {
+  return (
+    <Card className="rounded-lg border-border/70 bg-card/80">
+      <CardHeader>
+        <CardTitle>Scenario report</CardTitle>
+        <CardDescription>Final feedback from manual decisions and script comparison</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3 text-sm">
+        <div className="grid grid-cols-2 gap-2">
+          <div className="rounded-md border border-border/70 bg-muted/25 p-3">
+            <div className="text-xs text-muted-foreground">Accepted / rejected</div>
+            <div className="metric-tabular mt-1 font-medium">
+              {report.acceptedDecisionCount} / {report.rejectedDecisionCount}
+            </div>
+          </div>
+          <div className="rounded-md border border-border/70 bg-muted/25 p-3">
+            <div className="text-xs text-muted-foreground">Risk cut</div>
+            <div className="metric-tabular mt-1 font-medium text-[var(--energy-positive)]">
+              {formatMwh(report.totalRiskCutMwh)}
+            </div>
+          </div>
+          <div className="rounded-md border border-border/70 bg-muted/25 p-3">
+            <div className="text-xs text-muted-foreground">Decision impact</div>
+            <div
+              className={cn(
+                "metric-tabular mt-1 font-medium",
+                colorForPnl(report.totalDecisionPnlImpact)
+              )}
+            >
+              {formatPln(report.totalDecisionPnlImpact)}
+            </div>
+          </div>
+          <div className="rounded-md border border-border/70 bg-muted/25 p-3">
+            <div className="text-xs text-muted-foreground">Missed opportunities</div>
+            <div className="metric-tabular mt-1 font-medium">
+              {hasBotResult ? report.missedOpportunityCount : "Pending"}
+            </div>
+          </div>
+        </div>
+        <Separator />
+        <div className="grid gap-2 text-xs">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-muted-foreground">Gap to script</span>
+            <span className={cn("metric-tabular font-medium", colorForPnl(-report.totalPnlGapToScript))}>
+              {hasBotResult ? formatPln(report.totalPnlGapToScript) : "Pending"}
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-muted-foreground">Avoidable imbalance cost</span>
+            <span className="metric-tabular font-medium text-[var(--energy-negative)]">
+              {hasBotResult ? formatPln(report.avoidableImbalanceCost) : "Pending"}
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-muted-foreground">Best decision</span>
+            <span className="metric-tabular text-right">{decisionSummary(report.bestDecision)}</span>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-muted-foreground">Worst decision</span>
+            <span className="metric-tabular text-right">
+              {decisionSummary(report.worstDecision)}
+            </span>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 function DecisionWorkbench() {
   const scenario = useSimulationStore((state) => state.scenario);
   const contracts = useSimulationStore((state) => state.contracts);
@@ -1491,6 +1745,7 @@ function DecisionWorkbench() {
 function MarketView() {
   const scenario = useSimulationStore((state) => state.scenario);
   const trades = useSimulationStore((state) => state.trades);
+  const decisionLog = useSimulationStore((state) => state.decisionLog);
   const currentPeriod = useSimulationStore((state) => state.currentPeriod);
   const setSelectedPeriod = useSimulationStore((state) => state.setSelectedPeriod);
   const periods = buildKnownMarketTape(scenario, currentPeriod).slice(
@@ -1560,6 +1815,7 @@ function MarketView() {
       <div className="flex flex-col gap-4">
         <OrderTicket />
         <DecisionWorkbench />
+        <DecisionLogPanel decisionLog={decisionLog} />
         <TradeTape trades={trades} />
       </div>
     </div>
@@ -1661,6 +1917,7 @@ function DuelView() {
   const scenario = useSimulationStore((state) => state.scenario);
   const contracts = useSimulationStore((state) => state.contracts);
   const trades = useSimulationStore((state) => state.trades);
+  const decisionLog = useSimulationStore((state) => state.decisionLog);
   const currentPeriod = useSimulationStore((state) => state.currentPeriod);
   const botResult = useSimulationStore((state) => state.botResult);
   const runBotComparison = useSimulationStore((state) => state.runBotComparison);
@@ -1684,6 +1941,23 @@ function DuelView() {
           ).projectedSettlement
         : undefined,
     [botResult, scenario, contracts, scenarioSetupTrades, currentPeriod]
+  );
+  const duelInsights = useMemo(
+    () =>
+      botResult
+        ? buildStrategyDuelInsights(
+            scenario,
+            contracts,
+            trades,
+            botResult.trades,
+            currentPeriod
+          )
+        : [],
+    [botResult, scenario, contracts, trades, currentPeriod]
+  );
+  const scenarioReport = useMemo(
+    () => buildScenarioDecisionReport(decisionLog, duelInsights, human, botProjectedSettlement),
+    [decisionLog, duelInsights, human, botProjectedSettlement]
   );
   const delta = botProjectedSettlement ? human.totalPnl - botProjectedSettlement.totalPnl : 0;
 
@@ -1759,27 +2033,31 @@ function DuelView() {
             </Table>
           </CardContent>
         </Card>
+        <DuelInsightsTable insights={duelInsights} hasBotResult={Boolean(botResult)} />
       </div>
-      <Card className="rounded-lg border-border/70 bg-card/80">
-        <CardHeader>
-          <CardTitle>Script strategy</CardTitle>
-          <CardDescription>Transparent v1 logic</CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-3 text-sm text-muted-foreground">
-          <p>Every tick, the script sees only forecasts, signed contracts, existing trades and public market prices for future periods.</p>
-          <p>It closes expected net positions when intraday bid/ask beats the expected imbalance settlement after transaction cost.</p>
-          <p>It keeps a small MWh buffer, avoids current-period gate closure, and caps trades by liquidity and risk limit.</p>
-          {botResult ? (
-            <Alert>
-              <ShieldCheckIcon data-icon="inline-start" />
-              <AlertTitle>Run complete</AlertTitle>
-              <AlertDescription>
-                Avoided {formatMwh(botResult.avoidedImbalanceMwh)} absolute imbalance vs do-nothing.
-              </AlertDescription>
-            </Alert>
-          ) : null}
-        </CardContent>
-      </Card>
+      <div className="flex flex-col gap-4">
+        <Card className="rounded-lg border-border/70 bg-card/80">
+          <CardHeader>
+            <CardTitle>Script strategy</CardTitle>
+            <CardDescription>Transparent v1 logic</CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3 text-sm text-muted-foreground">
+            <p>Every tick, the script sees only forecasts, signed contracts, existing trades and public market prices for future periods.</p>
+            <p>It closes expected net positions when intraday bid/ask beats the expected imbalance settlement after transaction cost.</p>
+            <p>It keeps a small MWh buffer, avoids current-period gate closure, and caps trades by liquidity and risk limit.</p>
+            {botResult ? (
+              <Alert>
+                <ShieldCheckIcon data-icon="inline-start" />
+                <AlertTitle>Run complete</AlertTitle>
+                <AlertDescription>
+                  Avoided {formatMwh(botResult.avoidedImbalanceMwh)} absolute imbalance vs do-nothing.
+                </AlertDescription>
+              </Alert>
+            ) : null}
+          </CardContent>
+        </Card>
+        <ScenarioReportCard report={scenarioReport} hasBotResult={Boolean(botResult)} />
+      </div>
     </div>
   );
 }

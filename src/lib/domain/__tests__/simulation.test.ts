@@ -3,7 +3,10 @@ import { describe, expect, it } from "vitest";
 import { createDefaultContracts } from "../contracts";
 import {
   buildDecisionCandidates,
+  buildDecisionLogEntry,
   buildOrderImpactPreview,
+  buildScenarioDecisionReport,
+  buildStrategyDuelInsights,
   pickBestDecisionCandidate,
 } from "../decisions";
 import {
@@ -379,6 +382,11 @@ describe("grid balancing simulation", () => {
       side: "buy",
       periodIndex: targetPeriod,
     });
+    expect(useSimulationStore.getState().decisionLog[0]).toMatchObject({
+      accepted: true,
+      periodIndex: targetPeriod,
+      side: "buy",
+    });
   });
 
   it("builds decision candidates that reduce expected imbalance when loaded", () => {
@@ -419,6 +427,46 @@ describe("grid balancing simulation", () => {
 
     expect(preview.accepted).toBe(true);
     expect(preview.imbalanceReductionMwh).toBeGreaterThan(0);
+    expect(preview.trade).toBeDefined();
+
+    const entry = buildDecisionLogEntry(preview, "10:45", 0);
+
+    expect(entry).toMatchObject({
+      accepted: true,
+      periodIndex: best.periodIndex,
+      side: best.recommendation,
+    });
+    expect(entry.summary).toContain("MWh moved expected imbalance");
+    expect(entry.imbalanceReductionMwh).toBeGreaterThan(0);
     expect(trades.some((trade) => trade.actor === "manual")).toBe(false);
+  });
+
+  it("builds duel insights and a scenario decision report from the same RDN setup", () => {
+    const scenario = createScenario("wind-drop");
+    const contracts = createDefaultContracts();
+    const setupTrades = buildDayAheadAuctionTrades(scenario, contracts);
+    const autopilot = runAutopilot(scenario, contracts, undefined, setupTrades);
+    const insights = buildStrategyDuelInsights(
+      scenario,
+      contracts,
+      setupTrades,
+      autopilot.trades,
+      95
+    );
+    const report = buildScenarioDecisionReport(
+      [],
+      insights,
+      settlePortfolio(scenario.periods, contracts, setupTrades),
+      autopilot.settlement
+    );
+
+    expect(insights.length).toBeGreaterThan(0);
+    expect(insights[0]).toMatchObject({
+      category: "missed-trade",
+    });
+    expect(report.missedOpportunityCount).toBe(insights.length);
+    expect(report.acceptedDecisionCount).toBe(0);
+    expect(report.rejectedDecisionCount).toBe(0);
+    expect(report.avoidableImbalanceCost).toBeGreaterThanOrEqual(0);
   });
 });
