@@ -1,11 +1,16 @@
 import { chromium } from "playwright";
 
 const url = process.env.SMOKE_URL ?? "http://localhost:3000";
-
-const browser = await chromium.launch({
-  channel: process.env.PLAYWRIGHT_CHANNEL ?? "chrome",
+const channel = process.env.PLAYWRIGHT_CHANNEL ?? "chrome";
+const launchOptions = {
   headless: true,
-});
+};
+
+if (channel !== "bundled") {
+  launchOptions.channel = channel;
+}
+
+const browser = await chromium.launch(launchOptions);
 
 const page = await browser.newPage({
   viewport: { width: 1280, height: 900 },

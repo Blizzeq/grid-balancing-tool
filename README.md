@@ -1,5 +1,7 @@
 # Grid Balancing Tool
 
+[![CI](https://github.com/Blizzeq/grid-balancing-tool/actions/workflows/ci.yml/badge.svg)](https://github.com/Blizzeq/grid-balancing-tool/actions/workflows/ci.yml)
+
 Grid Balancing Tool is an interactive simulator for learning how an electricity
 portfolio behaves across a 15-minute trading day. It combines physical contract
 books, day-ahead setup trades, intraday execution, imbalance settlement, and a
@@ -57,6 +59,8 @@ The release checks cover both domain logic and rendered application behavior:
   switching, scenario editing, trading, strategy duel, replay, and contract
   signing.
 - Production build must complete successfully on Next.js 16.
+- GitHub Actions runs the same quality gate on pushes and pull requests to
+  `main`.
 
 ## Data Integrity
 

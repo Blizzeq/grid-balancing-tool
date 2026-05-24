@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Typecheck, test, build, and smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm run test
+
+      - name: Build
+        run: npm run build
+
+      - name: Start app
+        run: |
+          npm run start -- --hostname 127.0.0.1 --port 3000 > /tmp/grid-balancing-tool.log 2>&1 &
+          echo $! > /tmp/grid-balancing-tool.pid
+
+      - name: Wait for app
+        run: |
+          for attempt in {1..60}; do
+            if curl -fsS http://127.0.0.1:3000 > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/grid-balancing-tool.log
+          exit 1
+
+      - name: Smoke test
+        env:
+          PLAYWRIGHT_CHANNEL: bundled
+          SMOKE_URL: http://127.0.0.1:3000
+        run: npm run smoke
+
+      - name: Print app log on failure
+        if: failure()
+        run: cat /tmp/grid-balancing-tool.log || true
