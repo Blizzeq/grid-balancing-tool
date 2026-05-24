@@ -1,4 +1,11 @@
-import type { PeriodSnapshot, Scenario, ScenarioDefinition, ScenarioId } from "./types";
+import {
+  scenarioConfigSchema,
+  type PeriodSnapshot,
+  type Scenario,
+  type ScenarioConfig,
+  type ScenarioDefinition,
+  type ScenarioId,
+} from "./types";
 
 const PERIODS_PER_DAY = 96;
 
@@ -64,6 +71,8 @@ interface ScenarioTuning {
   windScale: number;
   loadScale: number;
   volatility: number;
+  priceVolatility: number;
+  liquidityStress: number;
   priceShift: number;
   middayPriceDip: number;
   eveningScarcity: number;
@@ -77,6 +86,8 @@ const SCENARIO_TUNING: Record<ScenarioId, ScenarioTuning> = {
     windScale: 0.9,
     loadScale: 0.92,
     volatility: 0.7,
+    priceVolatility: 1,
+    liquidityStress: 0,
     priceShift: -70,
     middayPriceDip: 350,
     eveningScarcity: 75,
@@ -86,6 +97,8 @@ const SCENARIO_TUNING: Record<ScenarioId, ScenarioTuning> = {
     windScale: 1.35,
     loadScale: 1.0,
     volatility: 1.1,
+    priceVolatility: 1,
+    liquidityStress: 0,
     priceShift: 10,
     middayPriceDip: 60,
     eveningScarcity: 115,
@@ -96,6 +109,8 @@ const SCENARIO_TUNING: Record<ScenarioId, ScenarioTuning> = {
     windScale: 0.9,
     loadScale: 1.3,
     volatility: 1.0,
+    priceVolatility: 1,
+    liquidityStress: 0,
     priceShift: 95,
     middayPriceDip: 20,
     eveningScarcity: 230,
@@ -105,6 +120,8 @@ const SCENARIO_TUNING: Record<ScenarioId, ScenarioTuning> = {
     windScale: 0.85,
     loadScale: 1.05,
     volatility: 1.25,
+    priceVolatility: 1,
+    liquidityStress: 0,
     priceShift: 70,
     middayPriceDip: 25,
     eveningScarcity: 180,
@@ -115,6 +132,8 @@ const SCENARIO_TUNING: Record<ScenarioId, ScenarioTuning> = {
     windScale: 0.75,
     loadScale: 0.88,
     volatility: 0.85,
+    priceVolatility: 1,
+    liquidityStress: 0,
     priceShift: -60,
     middayPriceDip: 280,
     eveningScarcity: 70,
@@ -124,6 +143,8 @@ const SCENARIO_TUNING: Record<ScenarioId, ScenarioTuning> = {
     windScale: 1.05,
     loadScale: 1.12,
     volatility: 1.75,
+    priceVolatility: 1,
+    liquidityStress: 0,
     priceShift: 35,
     middayPriceDip: 120,
     eveningScarcity: 210,
@@ -168,6 +189,70 @@ function formatPeriodLabel(index: number): string {
 
 function round(value: number, precision = 2): number {
   return Number(value.toFixed(precision));
+}
+
+export function createDefaultScenarioConfig(id: ScenarioId): ScenarioConfig {
+  const definition = SCENARIOS.find((scenario) => scenario.id === id) ?? SCENARIOS[0];
+  const tuning = SCENARIO_TUNING[definition.id];
+
+  return {
+    seed: definition.seed,
+    pvIntensity: 1,
+    windVolatility: 1,
+    loadStress: 1,
+    liquidityStress: tuning.liquidityStress,
+    priceVolatility: tuning.priceVolatility,
+    outageProbability: tuning.outageWindow ? 1 : 0,
+  };
+}
+
+function buildGeneratedOutageWindow(
+  definition: ScenarioDefinition,
+  seed: number
+): [number, number] {
+  const rng = createRng(seed ^ definition.seed ^ 0x9e3779b9);
+  const start = 44 + Math.floor(rng() * 32);
+  const duration = 6 + Math.floor(rng() * 12);
+
+  return [start, Math.min(start + duration, 88)];
+}
+
+function resolveOutageWindow(
+  definition: ScenarioDefinition,
+  baseTuning: ScenarioTuning,
+  config: ScenarioConfig
+): [number, number] | undefined {
+  if (config.outageProbability <= 0) {
+    return undefined;
+  }
+
+  if (baseTuning.outageWindow && config.outageProbability >= 1) {
+    return baseTuning.outageWindow;
+  }
+
+  const outageRng = createRng(config.seed ^ definition.seed ^ 0x7f4a7c15);
+  const outageHappens = outageRng() <= config.outageProbability;
+
+  return outageHappens
+    ? baseTuning.outageWindow ?? buildGeneratedOutageWindow(definition, config.seed)
+    : undefined;
+}
+
+function buildScenarioTuning(
+  definition: ScenarioDefinition,
+  config: ScenarioConfig
+): ScenarioTuning {
+  const baseTuning = SCENARIO_TUNING[definition.id];
+
+  return {
+    ...baseTuning,
+    pvScale: baseTuning.pvScale * config.pvIntensity,
+    loadScale: baseTuning.loadScale * config.loadStress,
+    volatility: baseTuning.volatility * config.windVolatility,
+    liquidityStress: config.liquidityStress,
+    priceVolatility: config.priceVolatility,
+    outageWindow: resolveOutageWindow(definition, baseTuning, config),
+  };
 }
 
 function createPeriod(
@@ -234,12 +319,14 @@ function createPeriod(
   const demandPressure = actualLoad;
   const middayDip = daylight > 0.55 ? tuning.middayPriceDip * daylight : 0;
   const eveningScarcity = isEveningPeak(index) ? tuning.eveningScarcity : 0;
+  const priceVolatility = tuning.priceVolatility;
   const outagePremium =
     tuning.outageWindow && index >= tuning.outageWindow[0] && index <= tuning.outageWindow[1]
-      ? 130 + (rng() - 0.5) * 45
+      ? 130 + (rng() - 0.5) * 45 * priceVolatility
       : 0;
   const scarcity =
-    Math.max(demandPressure - renewablePressure, 0) * (9 + tuning.volatility * 2);
+    Math.max(demandPressure - renewablePressure, 0) *
+    (9 + tuning.volatility * 2 * priceVolatility);
   const spotPrice =
     290 +
     tuning.priceShift +
@@ -247,16 +334,20 @@ function createPeriod(
     middayDip +
     eveningScarcity +
     outagePremium +
-    (rng() - 0.5) * 45 * tuning.volatility;
+    (rng() - 0.5) * 45 * tuning.volatility * priceVolatility;
   const rdnPrice = round(spotPrice, 2);
 
   const spread = clamp(
-    12 + tuning.volatility * 11 + Math.abs(spotPrice - 320) * 0.018,
+    12 +
+      tuning.volatility * 11 * priceVolatility +
+      Math.abs(spotPrice - 320) * 0.018 * priceVolatility,
     8,
-    68
+    68 + Math.max(priceVolatility - 1, 0) * 24
   );
-  const imbalancePremium = 35 + tuning.volatility * 28 + (isEveningPeak(index) ? 45 : 0);
-  const longDiscount = 28 + tuning.volatility * 18 + (daylight > 0.6 ? 24 : 0);
+  const imbalancePremium =
+    35 + tuning.volatility * 28 * priceVolatility + (isEveningPeak(index) ? 45 : 0);
+  const longDiscount =
+    28 + tuning.volatility * 18 * priceVolatility + (daylight > 0.6 ? 24 : 0);
 
   return {
     index,
@@ -273,7 +364,14 @@ function createPeriod(
     imbalanceLongPrice: round(spotPrice - longDiscount, 2),
     imbalanceShortPrice: round(spotPrice + imbalancePremium, 2),
     liquidityMwh: round(
-      clamp(32 - tuning.volatility * 5 - (isEveningPeak(index) ? 7 : 0), 8, 45),
+      clamp(
+        32 -
+          tuning.volatility * 5 -
+          (isEveningPeak(index) ? 7 : 0) -
+          tuning.liquidityStress * 18,
+        tuning.liquidityStress > 0 ? 4 : 8,
+        45
+      ),
       1
     ),
     weather: {
@@ -285,10 +383,16 @@ function createPeriod(
   };
 }
 
-export function createScenario(id: ScenarioId = "sunny-negative"): Scenario {
+export function createScenario(
+  id: ScenarioId = "sunny-negative",
+  config?: ScenarioConfig
+): Scenario {
   const definition = SCENARIOS.find((scenario) => scenario.id === id) ?? SCENARIOS[0];
-  const tuning = SCENARIO_TUNING[definition.id];
-  const rng = createRng(definition.seed);
+  const scenarioConfig = scenarioConfigSchema.parse(
+    config ?? createDefaultScenarioConfig(definition.id)
+  );
+  const tuning = buildScenarioTuning(definition, scenarioConfig);
+  const rng = createRng(scenarioConfig.seed);
   const periods = Array.from({ length: PERIODS_PER_DAY }, (_, index) =>
     createPeriod(definition, tuning, index, rng)
   );
@@ -297,10 +401,12 @@ export function createScenario(id: ScenarioId = "sunny-negative"): Scenario {
     definition,
     metadata: {
       source: "synthetic-calibrated",
-      seed: definition.seed,
+      seed: scenarioConfig.seed,
       deliveryDate: "2025-05-13",
       marketArea: "PL Market",
+      currency: "PLN",
       generatedAtLabel: "2025-05-12 14:30",
+      config: scenarioConfig,
     },
     periods,
   };

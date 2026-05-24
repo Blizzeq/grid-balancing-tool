@@ -18,6 +18,28 @@ export type TradeActor = "manual" | "script" | "scenario";
 export type TradeSide = "buy" | "sell";
 export type GameMode = "manual" | "manual-with-advice" | "autopilot" | "replay";
 
+export const currencyCodeSchema = z.enum(["PLN"]);
+export type CurrencyCode = z.infer<typeof currencyCodeSchema>;
+
+export const portfolioIdSchema = z.enum([
+  "alpha-power",
+  "renewables-ppa",
+  "industrial-supply",
+]);
+export type PortfolioId = z.infer<typeof portfolioIdSchema>;
+
+export const scenarioConfigSchema = z.object({
+  seed: z.number().int().min(1).max(999999),
+  pvIntensity: z.number().min(0.4).max(2.2),
+  windVolatility: z.number().min(0.4).max(2.2),
+  loadStress: z.number().min(0.6).max(1.8),
+  liquidityStress: z.number().min(0).max(1),
+  priceVolatility: z.number().min(0.5).max(2.2),
+  outageProbability: z.number().min(0).max(1),
+});
+
+export type ScenarioConfig = z.infer<typeof scenarioConfigSchema>;
+
 export interface WeatherPoint {
   cloudCover: number;
   irradiance: number;
@@ -57,7 +79,9 @@ export interface ScenarioMetadata {
   seed: number;
   deliveryDate: string;
   marketArea: string;
+  currency: CurrencyCode;
   generatedAtLabel: string;
+  config: ScenarioConfig;
 }
 
 export interface Scenario {
@@ -158,6 +182,17 @@ export interface Contract {
 export interface ContractTemplate extends Omit<Contract, "id"> {
   rationale: string;
   risk: string;
+}
+
+export interface PortfolioDefinition {
+  id: PortfolioId;
+  name: string;
+  shortName: string;
+  description: string;
+  marketArea: string;
+  baseCurrency: CurrencyCode;
+  balancingParty: string;
+  defaultContractTemplateIds: string[];
 }
 
 export interface MarketTrade {

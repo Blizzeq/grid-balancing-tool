@@ -28,6 +28,10 @@ export interface OrderImpactPreview {
   pnlImpact: number;
   imbalanceReductionMwh: number;
   executionPrice?: number;
+  vwapSlippagePlnMwh: number;
+  spreadCostPln: number;
+  transactionFeePln: number;
+  totalExecutionCostPln: number;
   trade?: MarketTrade;
 }
 
@@ -159,6 +163,10 @@ export function buildOrderImpactPreview(
       afterPeriodPnl: before.periodPnl,
       pnlImpact: 0,
       imbalanceReductionMwh: 0,
+      vwapSlippagePlnMwh: execution.quote?.vwapSlippagePlnMwh ?? 0,
+      spreadCostPln: execution.quote?.spreadCostPln ?? 0,
+      transactionFeePln: execution.quote?.transactionFeePln ?? 0,
+      totalExecutionCostPln: execution.quote?.totalExecutionCostPln ?? 0,
     };
   }
 
@@ -176,7 +184,7 @@ export function buildOrderImpactPreview(
     periodIndex: period.index,
     label: period.label,
     side: draft.side,
-    volumeMwh: draft.volumeMwh,
+    volumeMwh: execution.trade.volumeMwh,
     limitPrice: draft.limitPrice,
     beforeImbalanceMwh: before.imbalanceMwh,
     afterImbalanceMwh: after.imbalanceMwh,
@@ -185,6 +193,10 @@ export function buildOrderImpactPreview(
     pnlImpact: round(after.periodPnl - before.periodPnl),
     imbalanceReductionMwh: round(Math.abs(before.imbalanceMwh) - Math.abs(after.imbalanceMwh)),
     executionPrice: execution.trade.pricePlnMwh,
+    vwapSlippagePlnMwh: execution.quote?.vwapSlippagePlnMwh ?? 0,
+    spreadCostPln: execution.quote?.spreadCostPln ?? 0,
+    transactionFeePln: execution.quote?.transactionFeePln ?? 0,
+    totalExecutionCostPln: execution.quote?.totalExecutionCostPln ?? 0,
     trade: execution.trade,
   };
 }

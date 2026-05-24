@@ -147,6 +147,7 @@ export function buildRiskAlerts(
   const safeCurrentPeriod = clampPeriodIndex(currentPeriod, scenario);
   const now = scenario.periods[safeCurrentPeriod]?.label ?? "00:00";
   const calibration = buildScenarioCalibrationReport(scenario);
+  const priceUnit = `${scenario.metadata.currency}/MWh`;
   const horizon = metrics.projectedSettlement.periods.slice(
     safeCurrentPeriod,
     Math.min(safeCurrentPeriod + 12, scenario.periods.length)
@@ -216,8 +217,8 @@ export function buildRiskAlerts(
       id: "price-spike",
       title: "Price Spike",
       description: priceSpike
-        ? `${priceSpike.label}: imbalance price ${priceSpike.imbalancePrice.toFixed(0)} PLN/MWh`
-        : `No >${calibration.priceSpikeThreshold.toFixed(0)} PLN/MWh spike in the next 3 hours`,
+        ? `${priceSpike.label}: imbalance price ${priceSpike.imbalancePrice.toFixed(0)} ${priceUnit}`
+        : `No >${calibration.priceSpikeThreshold.toFixed(0)} ${priceUnit} spike in the next 3 hours`,
       timeLabel: now,
       tone: priceSpike ? "warning" : "info",
     },

@@ -8,15 +8,48 @@ import {
   type PeriodSnapshot,
   type Scenario,
   type ScenarioCalibrationReport,
+  type TradeSide,
 } from "./types";
 
 const TRANSACTION_FEE_PLN_MWH = 0.75;
 const DAY_AHEAD_HEDGE_RATIO = 0.78;
+const MIN_EXECUTABLE_RDB_MWH = 0.1;
+const RDB_DEPTH_VOLUME_SHARES = [0.35, 0.35, 0.3] as const;
 
 export interface OrderExecution {
   accepted: boolean;
   trade?: MarketTrade;
   reason: string;
+  quote?: RdbExecutionQuote;
+}
+
+export interface RdbBookLevel {
+  level: number;
+  bidPrice: number;
+  askPrice: number;
+  volumeMwh: number;
+  cumulativeVolumeMwh: number;
+}
+
+export interface RdbFillLevel {
+  level: number;
+  pricePlnMwh: number;
+  volumeMwh: number;
+}
+
+export interface RdbExecutionQuote {
+  side: TradeSide;
+  requestedVolumeMwh: number;
+  filledVolumeMwh: number;
+  averagePricePlnMwh: number;
+  bestPricePlnMwh: number;
+  midpointPricePlnMwh: number;
+  vwapSlippagePlnMwh: number;
+  spreadCostPln: number;
+  transactionFeePln: number;
+  totalExecutionCostPln: number;
+  partialFill: boolean;
+  fills: RdbFillLevel[];
 }
 
 function round(value: number, precision = 2): number {
@@ -145,6 +178,107 @@ export function buildScenarioCalibrationReport(
   };
 }
 
+export function buildRdbDepth(period: PeriodSnapshot): RdbBookLevel[] {
+  const spread = Math.max(period.intradayAsk - period.intradayBid, 1);
+  const priceStep = Math.max(2, spread * 0.2);
+  let remainingVolume = period.liquidityMwh;
+
+  return RDB_DEPTH_VOLUME_SHARES.map((share, index) => {
+    const level = index + 1;
+    const volumeMwh =
+      index === RDB_DEPTH_VOLUME_SHARES.length - 1
+        ? remainingVolume
+        : round(period.liquidityMwh * share, 1);
+
+    remainingVolume = round(Math.max(0, remainingVolume - volumeMwh), 1);
+
+    return {
+      level,
+      bidPrice: round(period.intradayBid - priceStep * index),
+      askPrice: round(period.intradayAsk + priceStep * index),
+      volumeMwh: round(volumeMwh, 1),
+      cumulativeVolumeMwh: round(
+        period.liquidityMwh - remainingVolume,
+        1
+      ),
+    };
+  });
+}
+
+export function quoteRdbOrder(draft: OrderDraft, period: PeriodSnapshot): RdbExecutionQuote {
+  const depth = buildRdbDepth(period);
+  const midpointPricePlnMwh = (period.intradayBid + period.intradayAsk) / 2;
+  const bestPricePlnMwh = draft.side === "buy" ? depth[0]?.askPrice ?? 0 : depth[0]?.bidPrice ?? 0;
+  const fills: RdbFillLevel[] = [];
+  let remainingVolumeMwh = draft.volumeMwh;
+
+  for (const level of depth) {
+    const pricePlnMwh = draft.side === "buy" ? level.askPrice : level.bidPrice;
+    const insideLimit =
+      draft.side === "buy" ? pricePlnMwh <= draft.limitPrice : pricePlnMwh >= draft.limitPrice;
+
+    if (!insideLimit || remainingVolumeMwh <= 0) {
+      break;
+    }
+
+    const volumeMwh = Math.min(remainingVolumeMwh, level.volumeMwh);
+
+    if (volumeMwh > 0) {
+      fills.push({
+        level: level.level,
+        pricePlnMwh,
+        volumeMwh: round(volumeMwh, 1),
+      });
+    }
+
+    remainingVolumeMwh = round(remainingVolumeMwh - volumeMwh, 1);
+  }
+
+  const filledVolumeMwh = round(
+    fills.reduce((sum, fill) => sum + fill.volumeMwh, 0),
+    1
+  );
+  const weightedPrice = fills.reduce(
+    (sum, fill) => sum + fill.volumeMwh * fill.pricePlnMwh,
+    0
+  );
+  const averagePricePlnMwh =
+    filledVolumeMwh > 0 ? round(weightedPrice / filledVolumeMwh) : 0;
+  const vwapSlippagePlnMwh =
+    filledVolumeMwh > 0
+      ? round(
+          draft.side === "buy"
+            ? averagePricePlnMwh - bestPricePlnMwh
+            : bestPricePlnMwh - averagePricePlnMwh
+        )
+      : 0;
+  const spreadCostPln =
+    filledVolumeMwh > 0
+      ? round(
+          filledVolumeMwh *
+            (draft.side === "buy"
+              ? averagePricePlnMwh - midpointPricePlnMwh
+              : midpointPricePlnMwh - averagePricePlnMwh)
+        )
+      : 0;
+  const transactionFeePln = round(filledVolumeMwh * TRANSACTION_FEE_PLN_MWH);
+
+  return {
+    side: draft.side,
+    requestedVolumeMwh: round(draft.volumeMwh, 1),
+    filledVolumeMwh,
+    averagePricePlnMwh,
+    bestPricePlnMwh,
+    midpointPricePlnMwh: round(midpointPricePlnMwh),
+    vwapSlippagePlnMwh,
+    spreadCostPln,
+    transactionFeePln,
+    totalExecutionCostPln: round(spreadCostPln + transactionFeePln),
+    partialFill: filledVolumeMwh < draft.volumeMwh,
+    fills,
+  };
+}
+
 export function executeOrder(
   draft: OrderDraft,
   period: PeriodSnapshot,
@@ -175,43 +309,38 @@ export function executeOrder(
     };
   }
 
-  if (draft.volumeMwh > period.liquidityMwh) {
+  const quote = quoteRdbOrder(draft, period);
+
+  if (quote.filledVolumeMwh < MIN_EXECUTABLE_RDB_MWH) {
+    const bestPrice = draft.side === "buy" ? "ask" : "bid";
+
     return {
       accepted: false,
-      reason: `Insufficient RDB liquidity: ${period.liquidityMwh.toFixed(1)} MWh available.`,
-    };
-  }
-
-  const liquidityRatio = draft.volumeMwh / Math.max(period.liquidityMwh, 1);
-  const slippage = liquidityRatio * 5.5;
-  const executablePrice =
-    draft.side === "buy" ? period.intradayAsk + slippage : period.intradayBid - slippage;
-
-  if (draft.side === "buy" && draft.limitPrice < executablePrice) {
-    return {
-      accepted: false,
-      reason: `Buy limit below best executable ask (${round(executablePrice)} PLN/MWh).`,
-    };
-  }
-
-  if (draft.side === "sell" && draft.limitPrice > executablePrice) {
-    return {
-      accepted: false,
-      reason: `Sell limit above best executable bid (${round(executablePrice)} PLN/MWh).`,
+      reason:
+        period.liquidityMwh < MIN_EXECUTABLE_RDB_MWH
+          ? "No executable RDB liquidity remains for this delivery period."
+          : `${draft.side === "buy" ? "Buy" : "Sell"} limit does not cross executable RDB ${bestPrice} depth.`,
+      quote,
     };
   }
 
   return {
     accepted: true,
-    reason: "Order matched on the simulated intraday book.",
+    reason:
+      quote.partialFill
+        ? `Partial fill: ${quote.filledVolumeMwh.toFixed(1)} of ${quote.requestedVolumeMwh.toFixed(
+            1
+          )} MWh matched across ${quote.fills.length} RDB depth levels.`
+        : `Order matched across ${quote.fills.length} simulated RDB depth levels.`,
+    quote,
     trade: {
       id: createTradeId(actor, draft.periodIndex, tradeCount),
       actor,
       side: draft.side,
       market: draft.market,
       periodIndex: draft.periodIndex,
-      volumeMwh: round(draft.volumeMwh),
-      pricePlnMwh: round(executablePrice),
+      volumeMwh: quote.filledVolumeMwh,
+      pricePlnMwh: quote.averagePricePlnMwh,
       submittedAtPeriod,
       accepted: true,
     },

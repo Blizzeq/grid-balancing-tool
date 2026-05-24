@@ -65,7 +65,13 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { CONTRACT_TEMPLATES } from "@/lib/domain/contracts";
+import {
+  CONTRACT_TEMPLATES,
+  createContractFromTemplate,
+  evaluateContractPrice,
+  evaluateContractVolume,
+  settleContractsForPeriod,
+} from "@/lib/domain/contracts";
 import {
   buildDecisionCandidates,
   buildOrderImpactPreview,
@@ -79,14 +85,37 @@ import {
 } from "@/lib/domain/decisions";
 import { formatMwh, formatPln, formatPrice, pnlTone } from "@/lib/domain/format";
 import { buildDashboardMetrics, getTradablePeriods } from "@/lib/domain/metrics";
-import { buildKnownMarketTape, getScenarioSetupTrades } from "@/lib/domain/markets";
-import { SCENARIOS } from "@/lib/domain/scenarios";
-import { settleContractsForPeriod } from "@/lib/domain/contracts";
+import {
+  buildKnownMarketTape,
+  buildRdbDepth,
+  buildScenarioCalibrationReport,
+  getScenarioSetupTrades,
+} from "@/lib/domain/markets";
+import {
+  buildReplayPeriodInsights,
+  buildReplayTimeline,
+  buildScenarioLessons,
+  type ReplayPeriodInsight,
+  type ReplayTimelineEvent,
+  type ReplayTimelineKind,
+} from "@/lib/domain/replay";
+import { PORTFOLIOS } from "@/lib/domain/portfolios";
+import { createDefaultScenarioConfig, createScenario, SCENARIOS } from "@/lib/domain/scenarios";
 import { settlePortfolio } from "@/lib/domain/settlement";
 import { runAutopilot } from "@/lib/domain/strategy";
 import type { AppView } from "@/lib/store/simulation-store";
 import { useSimulationStore } from "@/lib/store/simulation-store";
-import type { MarketTrade, ScenarioId } from "@/lib/domain/types";
+import type {
+  Contract,
+  CurrencyCode,
+  KnownPeriodView,
+  MarketTrade,
+  PeriodSnapshot,
+  RiskAlert,
+  ScenarioCalibrationReport,
+  ScenarioConfig,
+  ScenarioId,
+} from "@/lib/domain/types";
 import { cn } from "@/lib/utils";
 
 const NAV_ITEMS: Array<{
@@ -110,6 +139,144 @@ const dashboardPanelClass =
 const dashboardHeaderClass = "px-3 py-2.5";
 
 const dashboardContentClass = "px-3 pb-3";
+
+type ScenarioRangeKey = Exclude<keyof ScenarioConfig, "seed">;
+type DashboardSignedContract = ReturnType<typeof buildDashboardMetrics>["signedContracts"][number];
+
+const scenarioConfigKeys: Array<keyof ScenarioConfig> = [
+  "seed",
+  "pvIntensity",
+  "windVolatility",
+  "loadStress",
+  "liquidityStress",
+  "priceVolatility",
+  "outageProbability",
+];
+
+const scenarioRangeControls: Array<{
+  key: ScenarioRangeKey;
+  label: string;
+  min: number;
+  max: number;
+  step: number;
+  formatValue: (value: number) => string;
+}> = [
+  {
+    key: "pvIntensity",
+    label: "PV intensity",
+    min: 0.4,
+    max: 2.2,
+    step: 0.05,
+    formatValue: (value) => `${value.toFixed(2)}x`,
+  },
+  {
+    key: "windVolatility",
+    label: "Wind volatility",
+    min: 0.4,
+    max: 2.2,
+    step: 0.05,
+    formatValue: (value) => `${value.toFixed(2)}x`,
+  },
+  {
+    key: "loadStress",
+    label: "Load stress",
+    min: 0.6,
+    max: 1.8,
+    step: 0.05,
+    formatValue: (value) => `${value.toFixed(2)}x`,
+  },
+  {
+    key: "liquidityStress",
+    label: "Liquidity stress",
+    min: 0,
+    max: 1,
+    step: 0.05,
+    formatValue: (value) => `${Math.round(value * 100)}%`,
+  },
+  {
+    key: "priceVolatility",
+    label: "Price volatility",
+    min: 0.5,
+    max: 2.2,
+    step: 0.05,
+    formatValue: (value) => `${value.toFixed(2)}x`,
+  },
+  {
+    key: "outageProbability",
+    label: "Outage probability",
+    min: 0,
+    max: 1,
+    step: 0.05,
+    formatValue: (value) => `${Math.round(value * 100)}%`,
+  },
+];
+
+function configsEqual(left: ScenarioConfig, right: ScenarioConfig): boolean {
+  return scenarioConfigKeys.every((key) => left[key] === right[key]);
+}
+
+function formatSignedDelta(value: number, unit: string, precision = 0): string {
+  const formatted = Math.abs(value).toLocaleString("en-US", {
+    maximumFractionDigits: precision,
+    minimumFractionDigits: precision,
+  });
+
+  return `${value > 0 ? "+" : value < 0 ? "-" : ""}${formatted}${unit}`;
+}
+
+function formatHourTick(value: string | number): string {
+  const label = String(value);
+
+  return label.endsWith(":00") ? `${label.slice(0, 2)}h` : label;
+}
+
+function formatCompactPnlAxis(value: string | number): string {
+  const numericValue = Number(value);
+  const absoluteValue = Math.abs(numericValue);
+
+  if (absoluteValue >= 1_000_000) {
+    const millions = numericValue / 1_000_000;
+    return `${millions.toFixed(absoluteValue >= 10_000_000 ? 0 : 1)}M`;
+  }
+
+  if (absoluteValue >= 1_000) {
+    return `${Math.round(numericValue / 1_000)}k`;
+  }
+
+  return numericValue.toFixed(0);
+}
+
+function priceUnitLabel(currency: string): string {
+  return `${currency}/MWh`;
+}
+
+function getSimulationStatusBadge({
+  isClosed,
+  isRunning,
+}: {
+  isClosed: boolean;
+  isRunning: boolean;
+}) {
+  if (isClosed) {
+    return {
+      label: "CLOSED",
+      className:
+        "border-[var(--energy-negative)]/55 bg-[var(--energy-negative)]/12 text-[var(--energy-negative)]",
+    };
+  }
+
+  if (isRunning) {
+    return {
+      label: "LIVE",
+      className: "border-primary/45 bg-primary/15 text-primary",
+    };
+  }
+
+  return {
+    label: "PAUSED",
+    className: "border-[#8a6a00] bg-[#392c00] text-[#f6d250]",
+  };
+}
 
 function colorForPnl(value: number): string {
   const tone = pnlTone(value);
@@ -179,7 +346,7 @@ function DashboardCard({
   className?: string;
 }) {
   return (
-    <Card className={cn(dashboardPanelClass, "gap-0 py-0", className)}>
+    <Card className={cn(dashboardPanelClass, "min-w-0 gap-0 py-0", className)}>
       <CardHeader
         className={cn(
           dashboardHeaderClass,
@@ -191,20 +358,18 @@ function DashboardCard({
         </CardTitle>
         {action ? <div className="min-w-0 sm:justify-self-end">{action}</div> : null}
       </CardHeader>
-      <CardContent className={dashboardContentClass}>{children}</CardContent>
+      <CardContent className={cn(dashboardContentClass, "min-w-0")}>{children}</CardContent>
     </Card>
   );
 }
 
-function SmallSelectPill({ children }: { children: React.ReactNode }) {
+function SmallInfoPill({ children }: { children: React.ReactNode }) {
   return (
-    <button
+    <span
       className="inline-flex h-7 items-center gap-2 rounded-md border border-[#2b4550] bg-[#0b171c] px-2.5 text-xs text-foreground"
-      type="button"
     >
       {children}
-      <ChevronDownIcon data-icon="inline-end" />
-    </button>
+    </span>
   );
 }
 
@@ -212,9 +377,197 @@ function StatusDivider() {
   return <div className="hidden h-8 w-px bg-[#2a414b] md:block" />;
 }
 
+function TimePulse({
+  children,
+  className,
+  pulseKey,
+  testId,
+}: {
+  children: React.ReactNode;
+  className?: string;
+  pulseKey: number | string;
+  testId: string;
+}) {
+  return (
+    <motion.span
+      key={pulseKey}
+      data-testid={testId}
+      className={cn("inline-block", className)}
+      initial={{
+        color: "var(--primary)",
+        scale: 1.04,
+        textShadow: "0 0 16px rgba(93, 232, 154, 0.36)",
+      }}
+      animate={{
+        color: "var(--foreground)",
+        scale: 1,
+        textShadow: "0 0 0 rgba(93, 232, 154, 0)",
+      }}
+      transition={{ duration: 0.42, ease: "easeOut" }}
+    >
+      {children}
+    </motion.span>
+  );
+}
+
+function getStatusMessagePresentation({
+  isClosed,
+  message,
+}: {
+  isClosed: boolean;
+  message: string;
+}) {
+  const normalizedMessage = message.toLowerCase();
+
+  if (
+    normalizedMessage.includes("not available") ||
+    normalizedMessage.includes("outside") ||
+    normalizedMessage.includes("unknown") ||
+    normalizedMessage.includes("already in the book")
+  ) {
+    return {
+      label: "Check",
+      Icon: AlertTriangleIcon,
+      className:
+        "border-[var(--energy-warning)]/45 bg-[var(--energy-warning)]/10 text-[var(--energy-warning)]",
+    };
+  }
+
+  if (isClosed || normalizedMessage.includes("closed")) {
+    return {
+      label: "Closed",
+      Icon: AlertTriangleIcon,
+      className:
+        "border-[var(--energy-negative)]/45 bg-[var(--energy-negative)]/10 text-[var(--energy-negative)]",
+    };
+  }
+
+  if (
+    normalizedMessage.includes("advanced") ||
+    normalizedMessage.includes("matched") ||
+    normalizedMessage.includes("signed") ||
+    normalizedMessage.includes("reset") ||
+    normalizedMessage.includes("switched")
+  ) {
+    return {
+      label: "Updated",
+      Icon: SparklesIcon,
+      className: "border-primary/40 bg-primary/10 text-primary",
+    };
+  }
+
+  return {
+    label: "Status",
+    Icon: InfoIcon,
+    className: "border-[#2b4550] bg-[#0a1418] text-muted-foreground",
+  };
+}
+
+function StatusMessageStrip({
+  isClosed,
+  message,
+}: {
+  isClosed: boolean;
+  message: string;
+}) {
+  const status = getStatusMessagePresentation({ isClosed, message });
+  const Icon = status.Icon;
+
+  return (
+    <motion.div
+      key={message}
+      aria-live="polite"
+      className={cn(
+        "mx-2 mt-2 grid min-h-10 grid-cols-[auto_minmax(0,1fr)] gap-2 rounded-md border px-3 py-2 text-xs shadow-[inset_0_1px_0_rgba(255,255,255,0.035)] xl:hidden",
+        status.className
+      )}
+      data-testid="status-message-strip"
+      initial={{ opacity: 0.86, y: -4 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.2, ease: "easeOut" }}
+    >
+      <Icon className="mt-0.5 size-4" aria-hidden="true" />
+      <div className="min-w-0">
+        <div className="text-[10px] font-semibold uppercase tracking-[0.08em]">
+          {status.label}
+        </div>
+        <div className="max-h-10 overflow-hidden break-words text-foreground">
+          {message}
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+function getRiskAlertPresentation(tone: RiskAlert["tone"]) {
+  if (tone === "danger") {
+    return {
+      label: "High",
+      Icon: AlertTriangleIcon,
+      className:
+        "border-[var(--energy-negative)]/45 bg-[var(--energy-negative)]/8 text-[var(--energy-negative)]",
+      badgeClassName:
+        "border-[var(--energy-negative)]/40 bg-[var(--energy-negative)]/10 text-[var(--energy-negative)]",
+    };
+  }
+
+  if (tone === "warning") {
+    return {
+      label: "Watch",
+      Icon: AlertTriangleIcon,
+      className:
+        "border-[var(--energy-warning)]/45 bg-[var(--energy-warning)]/8 text-[var(--energy-warning)]",
+      badgeClassName:
+        "border-[var(--energy-warning)]/40 bg-[var(--energy-warning)]/10 text-[var(--energy-warning)]",
+    };
+  }
+
+  return {
+    label: "Info",
+    Icon: InfoIcon,
+    className: "border-[#264753] bg-[#0a1418] text-[var(--energy-cyan)]",
+    badgeClassName: "border-[var(--energy-cyan)]/35 bg-[var(--energy-cyan)]/10 text-[var(--energy-cyan)]",
+  };
+}
+
+function RiskAlertRow({ alert }: { alert: RiskAlert }) {
+  const presentation = getRiskAlertPresentation(alert.tone);
+  const Icon = presentation.Icon;
+
+  return (
+    <div
+      className={cn(
+        "grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 rounded-md border px-2 py-1.5 text-[11px] md:grid-cols-[16px_112px_minmax(0,1fr)_52px] md:items-center md:px-1.5 md:py-1",
+        presentation.className
+      )}
+      data-testid="risk-alert-row"
+      data-tone={alert.tone}
+    >
+      <Icon className="mt-0.5 size-4 md:mt-0" aria-hidden="true" />
+      <div className="min-w-0 md:hidden">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="truncate font-semibold">{alert.title}</span>
+          <Badge className={cn("h-5 border px-1.5 text-[10px]", presentation.badgeClassName)}>
+            {presentation.label}
+          </Badge>
+        </div>
+        <div className="mt-1 break-words text-muted-foreground">{alert.description}</div>
+      </div>
+      <span className="hidden font-semibold md:block">{alert.title}</span>
+      <span className="hidden truncate text-muted-foreground md:block">{alert.description}</span>
+      <div className="metric-tabular text-right text-muted-foreground">
+        {alert.timeLabel}
+      </div>
+    </div>
+  );
+}
+
 function TopStatusBar() {
   const scenarioId = useSimulationStore((state) => state.scenarioId);
   const setScenario = useSimulationStore((state) => state.setScenario);
+  const portfolio = useSimulationStore((state) => state.portfolio);
+  const portfolioId = useSimulationStore((state) => state.portfolioId);
+  const setPortfolio = useSimulationStore((state) => state.setPortfolio);
   const mode = useSimulationStore((state) => state.mode);
   const setMode = useSimulationStore((state) => state.setMode);
   const currentPeriod = useSimulationStore((state) => state.currentPeriod);
@@ -228,11 +581,170 @@ function TopStatusBar() {
   const setSpeed = useSimulationStore((state) => state.setSpeed);
   const scenario = useSimulationStore((state) => state.scenario);
   const period = scenario.periods[currentPeriod];
-  const nextPeriod = scenario.periods[Math.min(currentPeriod + 1, scenario.periods.length - 1)];
+  const nextPeriodEndLabel =
+    currentPeriod >= scenario.periods.length - 1
+      ? "00:00"
+      : scenario.periods[currentPeriod + 1]?.label ?? "00:00";
+  const simulationStatus = getSimulationStatusBadge({ isClosed, isRunning });
 
   return (
-    <header className="mx-2 mt-2 rounded-md border border-[#263f49] bg-[#0d1a20]/95 px-4 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
-      <div className="flex flex-wrap items-center gap-4 xl:flex-nowrap xl:gap-4">
+    <header className="mx-2 mt-2 rounded-md border border-[#263f49] bg-[#0d1a20]/95 px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)] md:px-4">
+      <div className="grid gap-2 md:hidden">
+        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
+          <div className="min-w-0">
+            <span className="text-[11px] text-muted-foreground">Scenario</span>
+            <select
+              aria-label="Scenario"
+              className="mt-1 h-7 w-full rounded-md border-0 bg-transparent p-0 text-sm font-medium text-foreground outline-none"
+              value={scenarioId}
+              onChange={(event) => setScenario(event.target.value as ScenarioId)}
+            >
+              {SCENARIOS.map((scenarioOption) => (
+                <option key={scenarioOption.id} value={scenarioOption.id}>
+                  {scenarioOption.shortName}
+                </option>
+              ))}
+            </select>
+          </div>
+          <Badge className="w-fit border border-primary/35 bg-primary/15 px-2 text-[11px] text-primary">
+            Intraday
+          </Badge>
+        </div>
+        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-end gap-3">
+          <div className="min-w-0">
+            <span className="text-[10px] text-muted-foreground">Portfolio</span>
+            <select
+              aria-label="Portfolio"
+              className="mt-1 h-7 w-full rounded-md border border-[#2b4550] bg-[#0a1418] px-2 text-sm font-medium text-foreground outline-none"
+              value={portfolioId}
+              onChange={(event) => setPortfolio(event.target.value)}
+            >
+              {PORTFOLIOS.map((portfolioOption) => (
+                <option key={portfolioOption.id} value={portfolioOption.id}>
+                  {portfolioOption.shortName}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="rounded-md border border-[#2b4550] bg-[#0a1418] px-2 py-1.5 text-right">
+            <div className="text-[10px] text-muted-foreground">Currency</div>
+            <div className="text-sm font-semibold">{portfolio.baseCurrency}</div>
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <div className="rounded-md border border-[#2b4550] bg-[#0a1418] p-2">
+            <span className="text-[10px] text-muted-foreground">Simulated Time</span>
+            <div className="mt-1 flex flex-wrap items-center gap-2">
+              <TimePulse
+                className="metric-tabular text-sm font-semibold"
+                pulseKey={`mobile-time-${currentPeriod}`}
+                testId="simulated-time-tick"
+              >
+                {scenario.metadata.deliveryDate} {period.label}
+              </TimePulse>
+              <Badge
+                className={cn(
+                  "border px-1.5 text-[10px]",
+                  simulationStatus.className
+                )}
+              >
+                {simulationStatus.label}
+              </Badge>
+            </div>
+          </div>
+          <div className="rounded-md border border-[#2b4550] bg-[#0a1418] p-2">
+            <span className="text-[10px] text-muted-foreground">Settlement</span>
+            <TimePulse
+              className="metric-tabular mt-1 text-sm font-semibold"
+              pulseKey={`mobile-settlement-${currentPeriod}`}
+              testId="settlement-period-tick"
+            >
+              {period.label} - {nextPeriodEndLabel}
+            </TimePulse>
+          </div>
+        </div>
+        <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-end gap-2">
+          <div className="min-w-0">
+            <span className="text-[10px] text-muted-foreground">Mode</span>
+            <select
+              aria-label="Game mode"
+              className="mt-1 h-8 w-full rounded-md border border-[#2b4550] bg-[#0a1418] px-2 text-sm font-medium text-foreground outline-none"
+              value={mode}
+              onChange={(event) => setMode(event.target.value as typeof mode)}
+            >
+              <option value="manual">Simulation</option>
+              <option value="manual-with-advice">Assisted</option>
+              <option value="autopilot">Autopilot</option>
+              <option value="replay">Replay</option>
+            </select>
+          </div>
+          <Button
+            aria-label={isRunning ? "Pause simulation" : "Play simulation"}
+            className="h-8 rounded-md px-3 text-xs"
+            disabled={isClosed && !isRunning}
+            variant="outline"
+            onClick={toggleRun}
+          >
+            {isRunning ? (
+              <PauseIcon data-icon="inline-start" />
+            ) : (
+              <PlayIcon data-icon="inline-start" />
+            )}
+            {isRunning ? "Pause" : "Play"}
+          </Button>
+          <select
+            aria-label="Simulation speed"
+            className="h-8 rounded-md border border-[#2b4550] bg-[#0a1418] px-2 text-xs text-foreground outline-none"
+            value={speed}
+            onChange={(event) => setSpeed(Number(event.target.value))}
+          >
+            {[0.5, 1, 2, 4, 8].map((candidate) => (
+              <option key={candidate} value={candidate}>
+                {candidate}x
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="grid grid-cols-[1fr_1fr_1fr_auto] gap-2">
+          <Button
+            aria-label="Step 15 minutes"
+            className="h-8 rounded-md px-2 text-xs"
+            disabled={isClosed}
+            variant="outline"
+            onClick={step}
+          >
+            <StepForwardIcon data-icon="inline-start" />
+            Step
+          </Button>
+          <Button
+            aria-label="Run to end"
+            className="h-8 rounded-md px-2 text-xs"
+            disabled={isClosed}
+            variant="outline"
+            onClick={runToEnd}
+          >
+            End
+          </Button>
+          <Button
+            aria-label="Reset scenario"
+            className="h-8 rounded-md px-2 text-xs"
+            variant="outline"
+            onClick={resetScenario}
+          >
+            <RotateCcwIcon data-icon="inline-start" />
+            Reset
+          </Button>
+          <div className="flex items-center gap-1">
+            <Button variant="ghost" size="icon-sm" aria-label="Help">
+              <HelpCircleIcon data-icon="inline-start" />
+            </Button>
+            <Button variant="ghost" size="icon-sm" aria-label="Settings">
+              <SettingsIcon data-icon="inline-start" />
+            </Button>
+          </div>
+        </div>
+      </div>
+      <div className="hidden flex-wrap items-center gap-4 md:flex 2xl:flex-nowrap 2xl:gap-4">
         <div className="flex min-w-[190px] flex-col gap-1">
           <span className="text-[11px] text-muted-foreground">Scenario</span>
           <select
@@ -261,18 +773,20 @@ function TopStatusBar() {
               <span className="metric-tabular whitespace-nowrap text-sm font-semibold">
                 2025-05-13
               </span>
-              <span className="metric-tabular text-sm font-semibold">{period.label}</span>
+              <TimePulse
+                className="metric-tabular text-sm font-semibold"
+                pulseKey={`desktop-time-${currentPeriod}`}
+                testId="simulated-time-tick"
+              >
+                {period.label}
+              </TimePulse>
               <Badge
                 className={cn(
                   "h-5 border px-2 text-[11px]",
-                  isClosed
-                    ? "border-muted bg-muted/30 text-muted-foreground"
-                    : isRunning
-                      ? "border-primary/35 bg-primary/15 text-primary"
-                      : "border-[var(--energy-warning)]/35 bg-[var(--energy-warning)]/10 text-[var(--energy-warning)]"
+                  simulationStatus.className
                 )}
               >
-                {isClosed ? "CLOSED" : isRunning ? "LIVE" : "PAUSED"}
+                {simulationStatus.label}
               </Badge>
             </div>
           </div>
@@ -284,9 +798,13 @@ function TopStatusBar() {
           </div>
           <div className="flex flex-col gap-1">
             <span className="text-[11px] text-muted-foreground">Settlement Period</span>
-            <span className="metric-tabular text-sm font-medium">
-              {period.label} - {nextPeriod.label} (15 min)
-            </span>
+            <TimePulse
+              className="metric-tabular text-sm font-medium"
+              pulseKey={`desktop-settlement-${currentPeriod}`}
+              testId="settlement-period-tick"
+            >
+              {period.label} - {nextPeriodEndLabel} (15 min)
+            </TimePulse>
           </div>
         </div>
         <StatusDivider />
@@ -385,6 +903,9 @@ function TopStatusBar() {
 function TradingShell({ children }: { children: React.ReactNode }) {
   const activeView = useSimulationStore((state) => state.activeView);
   const setView = useSimulationStore((state) => state.setView);
+  const portfolio = useSimulationStore((state) => state.portfolio);
+  const portfolioId = useSimulationStore((state) => state.portfolioId);
+  const setPortfolio = useSimulationStore((state) => state.setPortfolio);
   const scenario = useSimulationStore((state) => state.scenario);
   const currentPeriod = useSimulationStore((state) => state.currentPeriod);
   const speed = useSimulationStore((state) => state.speed);
@@ -430,18 +951,37 @@ function TradingShell({ children }: { children: React.ReactNode }) {
           </nav>
           <div className="mt-auto hidden flex-col gap-2 p-3 lg:flex">
             <div className="rounded-md border border-[#263f49] bg-[#0d1a20] p-3">
-              <div className="flex items-center justify-between text-xs text-muted-foreground">
-                <span>Portfolio</span>
-                <ChevronDownIcon data-icon="inline-end" />
+              <label className="text-xs text-muted-foreground" htmlFor="sidebar-portfolio">
+                Portfolio
+              </label>
+              <select
+                aria-label="Portfolio book"
+                className="mt-1 h-7 w-full rounded-md border-0 bg-transparent p-0 text-sm font-medium text-foreground outline-none"
+                id="sidebar-portfolio"
+                value={portfolioId}
+                onChange={(event) => setPortfolio(event.target.value)}
+              >
+                {PORTFOLIOS.map((portfolioOption) => (
+                  <option key={portfolioOption.id} value={portfolioOption.id}>
+                    {portfolioOption.name}
+                  </option>
+                ))}
+              </select>
+              <div className="mt-1 max-h-8 overflow-hidden text-[11px] text-muted-foreground">
+                {portfolio.description}
               </div>
-              <div className="mt-1 text-sm font-medium">Alpha Power</div>
             </div>
             <div className="rounded-md border border-[#263f49] bg-[#0d1a20] p-3">
-              <div className="flex items-center justify-between text-xs text-muted-foreground">
-                <span>Currency</span>
-                <ChevronDownIcon data-icon="inline-end" />
+              <div className="text-xs text-muted-foreground">Settlement currency</div>
+              <div className="mt-1 flex items-center justify-between gap-2">
+                <span className="text-sm font-medium">{portfolio.baseCurrency}</span>
+                <Badge className="h-5 border border-primary/30 bg-primary/10 px-2 text-[10px] text-primary">
+                  {portfolio.marketArea}
+                </Badge>
               </div>
-              <div className="mt-1 text-sm font-medium">PLN</div>
+              <div className="mt-1 text-[11px] text-muted-foreground">
+                {portfolio.balancingParty}
+              </div>
             </div>
             <Button variant="outline" className="h-12 justify-between rounded-md">
               Collapse
@@ -451,7 +991,8 @@ function TradingShell({ children }: { children: React.ReactNode }) {
         </aside>
         <main className="flex min-w-0 flex-1 flex-col xl:h-screen">
           <TopStatusBar />
-          <div className="min-h-0 flex-1 overflow-auto xl:overflow-hidden">{children}</div>
+          <StatusMessageStrip isClosed={isClosed} message={statusMessage} />
+          <div className="min-h-0 flex-1 overflow-auto">{children}</div>
           <footer className="hidden h-12 items-center justify-between border-t border-[#263f49] bg-[#0d1a20] px-5 text-xs text-muted-foreground xl:flex">
             <div className="flex items-center gap-8">
               <span className="flex items-center gap-2">
@@ -463,6 +1004,7 @@ function TradingShell({ children }: { children: React.ReactNode }) {
                 {scenario.periods[currentPeriod]?.label ?? "00:00"}
                 <span className="size-1.5 rounded-full bg-primary" />
               </span>
+              <span className="max-w-[260px] truncate">Portfolio: {portfolio.name}</span>
               <span className="max-w-[520px] truncate">Status: {statusMessage}</span>
             </div>
             <div className="flex items-center gap-8">
@@ -508,6 +1050,7 @@ function OrderTicket() {
     () => buildOrderImpactPreview(scenario, contracts, trades, currentPeriod, orderDraft),
     [scenario, contracts, trades, currentPeriod, orderDraft]
   );
+  const rdbDepth = useMemo(() => buildRdbDepth(period), [period]);
 
   return (
     <DashboardCard
@@ -517,7 +1060,7 @@ function OrderTicket() {
           RDB/SIDC
         </Badge>
       }
-      className="xl:h-[402px]"
+      className="xl:h-[560px]"
     >
       <div className="flex flex-col gap-2">
         <div className="grid h-8 grid-cols-2 overflow-hidden rounded-md border border-[#2b4550] bg-[#0a1418]">
@@ -562,6 +1105,7 @@ function OrderTicket() {
           <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
             Delivery
             <select
+              aria-label="Delivery period"
               className="h-7 rounded-md border border-[#2b4550] bg-[#0a1418] px-2 text-xs text-foreground outline-none"
               disabled={!canTrade}
               value={selectedPeriod}
@@ -595,7 +1139,7 @@ function OrderTicket() {
                 updateOrderDraft({ volumeMwh: Number(event.target.value) })
               }
             />
-            {[10, 25, 50, 100].map((volume) => (
+            {[10, 25, 50, 80].map((volume) => (
               <Button
                 key={volume}
                 variant={orderDraft.volumeMwh === volume ? "default" : "outline"}
@@ -612,7 +1156,7 @@ function OrderTicket() {
           </div>
         </label>
         <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
-          Price (PLN/MWh)
+          Price ({priceUnitLabel(scenario.metadata.currency)})
           <div className="grid grid-cols-[minmax(0,1fr)_repeat(4,44px)] gap-2">
             <Input
               className="h-7 rounded-md text-xs"
@@ -639,30 +1183,32 @@ function OrderTicket() {
             ))}
           </div>
         </label>
-        <div className="grid grid-cols-3 gap-2 text-center">
-          <div className="rounded-md border border-[#2b4550] bg-[#0a1418] p-2">
-            <span className="whitespace-nowrap text-[10px] text-muted-foreground">Best Bid (PLN/MWh)</span>
-            <div className="metric-tabular text-lg font-semibold text-primary">
-              {period.intradayBid.toFixed(2)}
-            </div>
-            <span className="text-[10px] text-muted-foreground">Volume (MWh)</span>
-            <div className="metric-tabular text-xs">{period.liquidityMwh.toFixed(1)}</div>
+        <div className="rounded-md border border-[#2b4550] bg-[#0a1418] p-2">
+          <div className="mb-1.5 flex items-center justify-between gap-2 text-[10px]">
+            <span className="font-medium text-foreground">RDB depth</span>
+            <span className="metric-tabular text-muted-foreground">
+              Mid {formatPrice((period.intradayBid + period.intradayAsk) / 2)}
+            </span>
           </div>
-          <div className="rounded-md border border-[#2b4550] bg-[#0a1418] p-2">
-            <span className="whitespace-nowrap text-[10px] text-muted-foreground">RDN Ref (PLN/MWh)</span>
-            <div className="metric-tabular text-lg font-semibold">
-              {period.rdnPrice.toFixed(2)}
-            </div>
-            <span className="text-[10px] text-muted-foreground">Volume (MWh)</span>
-            <div className="metric-tabular text-xs">{Math.max(orderDraft.volumeMwh, 0).toFixed(1)}</div>
-          </div>
-          <div className="rounded-md border border-[#2b4550] bg-[#0a1418] p-2">
-            <span className="whitespace-nowrap text-[10px] text-muted-foreground">Best Ask (PLN/MWh)</span>
-            <div className="metric-tabular text-lg font-semibold text-[var(--energy-negative)]">
-              {period.intradayAsk.toFixed(2)}
-            </div>
-            <span className="text-[10px] text-muted-foreground">Volume (MWh)</span>
-            <div className="metric-tabular text-xs">{period.liquidityMwh.toFixed(1)}</div>
+          <div className="grid grid-cols-[32px_1fr_1fr_1fr] gap-1 text-[10px]">
+            <span className="text-muted-foreground">Lvl</span>
+            <span className="text-right text-muted-foreground">Bid</span>
+            <span className="text-right text-muted-foreground">Vol</span>
+            <span className="text-right text-muted-foreground">Ask</span>
+            {rdbDepth.map((level) => (
+              <div key={level.level} className="contents">
+                <span className="metric-tabular text-muted-foreground">L{level.level}</span>
+                <span className="metric-tabular text-right text-primary">
+                  {level.bidPrice.toFixed(2)}
+                </span>
+                <span className="metric-tabular text-right text-foreground">
+                  {level.volumeMwh.toFixed(1)}
+                </span>
+                <span className="metric-tabular text-right text-[var(--energy-negative)]">
+                  {level.askPrice.toFixed(2)}
+                </span>
+              </div>
+            ))}
           </div>
         </div>
         <Button
@@ -672,10 +1218,42 @@ function OrderTicket() {
         >
           Place {orderDraft.side === "buy" ? "Buy" : "Sell"} Order
         </Button>
-        <div className="grid grid-cols-3 gap-3 pt-1 text-xs">
+        <div className="grid grid-cols-2 gap-3 pt-1 text-xs sm:grid-cols-4">
+          <div>
+            <div className="text-muted-foreground">Expected Fill</div>
+            <div className="metric-tabular text-sm">
+              {orderImpact.accepted ? formatMwh(orderImpact.volumeMwh) : formatMwh(0)}
+            </div>
+          </div>
+          <div>
+            <div className="text-muted-foreground">VWAP Price</div>
+            <div className="metric-tabular text-sm">
+              {orderImpact.accepted && orderImpact.executionPrice
+                ? formatPrice(orderImpact.executionPrice)
+                : "n/a"}
+            </div>
+          </div>
+          <div>
+            <div className="text-muted-foreground">Spread Cost</div>
+            <div className="metric-tabular text-sm text-[var(--energy-negative)]">
+              {formatPln(-orderImpact.spreadCostPln)}
+            </div>
+          </div>
+          <div>
+            <div className="text-muted-foreground">Fees</div>
+            <div className="metric-tabular text-sm text-[var(--energy-negative)]">
+              {formatPln(-orderImpact.transactionFeePln)}
+            </div>
+          </div>
           <div>
             <div className="text-muted-foreground">Available Capacity</div>
             <div className="metric-tabular text-sm">{formatMwh(period.liquidityMwh)}</div>
+          </div>
+          <div>
+            <div className="text-muted-foreground">Slippage</div>
+            <div className="metric-tabular text-sm text-muted-foreground">
+              {formatPrice(orderImpact.vwapSlippagePlnMwh)}
+            </div>
           </div>
           <div>
             <div className="text-muted-foreground">Impact</div>
@@ -697,9 +1275,11 @@ function OrderTicket() {
             </div>
           </div>
         </div>
-        <div className="truncate text-[10px] text-muted-foreground">
+        <div className="text-[10px] leading-4 text-muted-foreground">
           {orderImpact.accepted
-            ? `After order: ${formatSignedMwh(orderImpact.afterImbalanceMwh)} expected imbalance`
+            ? `${orderImpact.reason} After order: ${formatSignedMwh(
+                orderImpact.afterImbalanceMwh
+              )} expected imbalance`
             : orderImpact.reason}
         </div>
       </div>
@@ -716,6 +1296,118 @@ function ContractDrawer({
 }) {
   const signContract = useSimulationStore((state) => state.signContract);
   const contracts = useSimulationStore((state) => state.contracts);
+  const scenario = useSimulationStore((state) => state.scenario);
+  const trades = useSimulationStore((state) => state.trades);
+  const currentPeriod = useSimulationStore((state) => state.currentPeriod);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onOpenChange(false);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onOpenChange, open]);
+
+  const contractPreviews = useMemo(() => {
+    const baseMetrics = buildDashboardMetrics(scenario, contracts, trades, currentPeriod);
+
+    return new Map(
+      CONTRACT_TEMPLATES.map((template) => {
+        const alreadySigned = contracts.some(
+          (contract) => contract.templateId === template.templateId
+        );
+        const previewContract = createContractFromTemplate(template.templateId, "preview");
+        const previewContracts = alreadySigned ? contracts : [...contracts, previewContract];
+        const previewMetrics = buildDashboardMetrics(
+          scenario,
+          previewContracts,
+          trades,
+          currentPeriod
+        );
+        const activePeriods = scenario.periods.filter(
+          (period) =>
+            period.index >= previewContract.deliveryStart &&
+            period.index <= previewContract.deliveryEnd
+        );
+        const dayVolumeMwh = activePeriods.reduce(
+          (sum, period) => sum + evaluateContractVolume(previewContract, period, "forecast"),
+          0
+        );
+        const weightedPrice = activePeriods.reduce((sum, period) => {
+          const volume = evaluateContractVolume(previewContract, period, "forecast");
+
+          return sum + volume * evaluateContractPrice(previewContract, period);
+        }, 0);
+        const averagePrice = dayVolumeMwh > 0 ? weightedPrice / dayVolumeMwh : 0;
+        const startLabel = scenario.periods[previewContract.deliveryStart]?.label ?? "00:00";
+        const endLabel =
+          previewContract.deliveryEnd >= scenario.periods.length - 1
+            ? "00:00"
+            : scenario.periods[previewContract.deliveryEnd + 1]?.label ??
+              scenario.periods[previewContract.deliveryEnd]?.label ??
+              "23:45";
+        const periodDeltas = previewMetrics.projectedSettlement.periods.map(
+          (period, index) =>
+            period.imbalanceMwh -
+            (baseMetrics.projectedSettlement.periods[index]?.imbalanceMwh ?? 0)
+        );
+        const profileBuckets = Array.from({ length: 8 }, (_, bucketIndex) => {
+          const start = bucketIndex * 12;
+          const bucketDeltas = periodDeltas.slice(start, start + 12);
+          const averageDeltaMwh =
+            bucketDeltas.reduce((sum, delta) => sum + delta, 0) / bucketDeltas.length;
+
+          return {
+            label: `${scenario.periods[start]?.label ?? "00:00"}-${
+              scenario.periods[start + 12]?.label ?? "00:00"
+            }`,
+            deltaMwh: alreadySigned ? 0 : averageDeltaMwh,
+          };
+        });
+        const peakDeltaMwh = alreadySigned
+          ? 0
+          : periodDeltas.reduce(
+              (peak, delta) => (Math.abs(delta) > Math.abs(peak) ? delta : peak),
+              0
+            );
+        const worsenedPeriodCount = alreadySigned
+          ? 0
+          : previewMetrics.projectedSettlement.periods.filter((period, index) => {
+              const basePeriod = baseMetrics.projectedSettlement.periods[index];
+
+              return basePeriod
+                ? Math.abs(period.imbalanceMwh) > Math.abs(basePeriod.imbalanceMwh) + 0.1
+                : false;
+            }).length;
+
+        return [
+          template.templateId,
+          {
+            currentNetMwh: alreadySigned
+              ? 0
+              : previewMetrics.currentPositionMwh - baseMetrics.currentPositionMwh,
+            dayVolumeMwh,
+            averagePrice,
+            pnlImpact: alreadySigned
+              ? 0
+              : previewMetrics.projectedSettlement.totalPnl -
+                baseMetrics.projectedSettlement.totalPnl,
+            deliveryWindow: `${startLabel}-${endLabel}`,
+            profileBuckets,
+            peakDeltaMwh,
+            worsenedPeriodCount,
+          },
+        ] as const;
+      })
+    );
+  }, [scenario, contracts, trades, currentPeriod]);
 
   if (!open) {
     return null;
@@ -732,33 +1424,44 @@ function ContractDrawer({
       <motion.aside
         aria-labelledby="contract-drawer-title"
         aria-modal="true"
-        className="absolute top-0 right-0 z-10 flex h-full w-full max-w-2xl flex-col gap-4 overflow-y-auto border-l border-border bg-popover shadow-2xl"
+        className="absolute top-0 right-0 z-10 flex h-full w-full max-w-2xl flex-col overflow-y-auto border-l border-border bg-popover shadow-2xl"
         initial={{ x: 36 }}
         animate={{ x: 0 }}
         exit={{ x: 36 }}
         transition={{ duration: 0.18, ease: "easeOut" }}
         role="dialog"
       >
-        <div className="flex items-start justify-between gap-4 p-4">
+        <div className="sticky top-0 z-20 flex items-start justify-between gap-4 border-b border-border/70 bg-popover/95 p-4 backdrop-blur">
           <div className="flex flex-col gap-1">
             <h2 id="contract-drawer-title" className="text-base font-medium">
               Sign simulated contract
             </h2>
             <p className="text-sm text-muted-foreground">
-            Contract templates are educational approximations of physical power positions.
+              Contract templates are educational approximations of physical power positions.
             </p>
           </div>
-          <Button variant="ghost" size="icon-sm" onClick={() => onOpenChange(false)}>
+          <Button
+            aria-label="Close contract drawer"
+            variant="ghost"
+            size="icon-sm"
+            type="button"
+            onClick={() => onOpenChange(false)}
+          >
             <XIcon data-icon="inline-start" />
             <span className="sr-only">Close</span>
           </Button>
         </div>
-        <div className="flex flex-col gap-3 px-4 pb-4">
+        <div className="flex flex-col gap-3 px-4 py-4">
           {CONTRACT_TEMPLATES.map((template) => {
             const signed = contracts.some((contract) => contract.templateId === template.templateId);
+            const preview = contractPreviews.get(template.templateId);
 
             return (
-              <Card key={template.templateId} className="rounded-lg">
+              <Card
+                key={template.templateId}
+                className="rounded-lg"
+                data-testid={`contract-template-${template.templateId}`}
+              >
                 <CardHeader>
                   <CardTitle className="text-base">{template.name}</CardTitle>
                   <CardDescription>
@@ -768,12 +1471,100 @@ function ContractDrawer({
                 </CardHeader>
                 <CardContent className="flex flex-col gap-3">
                   <p className="text-sm text-muted-foreground">{template.rationale}</p>
+                  {preview ? (
+                    <div className="rounded-lg border border-border/70 bg-muted/20 p-3 text-xs">
+                      <div className="grid gap-2 sm:grid-cols-3">
+                        <div>
+                          <div className="text-muted-foreground">Current net</div>
+                          <div className="metric-tabular text-sm font-medium text-foreground">
+                            {formatSignedMwh(preview.currentNetMwh)}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-muted-foreground">Day volume</div>
+                          <div className="metric-tabular text-sm font-medium text-foreground">
+                            {formatMwh(preview.dayVolumeMwh)}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-muted-foreground">Average price</div>
+                          <div className="metric-tabular text-sm font-medium text-foreground">
+                            {formatPrice(preview.averagePrice)}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-muted-foreground">PnL impact</div>
+                          <div
+                            className={cn(
+                              "metric-tabular text-sm font-medium",
+                              colorForPnl(preview.pnlImpact)
+                            )}
+                          >
+                            {formatPln(preview.pnlImpact)}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-muted-foreground">Delivery</div>
+                          <div className="metric-tabular text-sm font-medium text-foreground">
+                            {preview.deliveryWindow}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-muted-foreground">Imbalance owner</div>
+                          <div className="text-sm font-medium text-foreground">
+                            {template.imbalanceResponsibility}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="mt-3 border-t border-border/70 pt-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="font-medium text-foreground">Profile impact</div>
+                          <div className="metric-tabular text-muted-foreground">
+                            Peak {formatSignedMwh(preview.peakDeltaMwh)} | worsens{" "}
+                            {preview.worsenedPeriodCount} periods
+                          </div>
+                        </div>
+                        <div className="mt-2 grid h-10 grid-cols-8 items-end gap-1">
+                          {preview.profileBuckets.map((bucket) => (
+                            <div
+                              key={bucket.label}
+                              aria-label={`${bucket.label}: ${formatSignedMwh(bucket.deltaMwh)}`}
+                              className={cn(
+                                "min-h-1 rounded-sm border border-border/60",
+                                bucket.deltaMwh > 0.1 && "bg-[var(--energy-positive)]/70",
+                                bucket.deltaMwh < -0.1 && "bg-[var(--energy-negative)]/70",
+                                Math.abs(bucket.deltaMwh) <= 0.1 && "bg-muted"
+                              )}
+                              style={{
+                                height: `${Math.min(
+                                  36,
+                                  Math.max(4, Math.abs(bucket.deltaMwh) * 1.3 + 4)
+                                )}px`,
+                              }}
+                              title={`${bucket.label}: ${formatSignedMwh(bucket.deltaMwh)}`}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                  <div className="grid gap-2 rounded-lg border border-border/70 bg-background/40 p-3 text-xs text-muted-foreground sm:grid-cols-2">
+                    <div>
+                      <div className="font-medium text-foreground">Nomination</div>
+                      <div>{template.nominationDeadline}</div>
+                    </div>
+                    <div>
+                      <div className="font-medium text-foreground">Penalty rule</div>
+                      <div>{template.penaltyRule}</div>
+                    </div>
+                  </div>
                   <div className="rounded-lg border border-border/70 bg-muted/30 p-3 text-xs text-muted-foreground">
                     {template.risk}
                   </div>
                   <Button
                     variant={signed ? "secondary" : "default"}
                     disabled={signed}
+                    data-testid={`sign-contract-${template.templateId}`}
                     onClick={() => signContract(template.templateId)}
                   >
                     <FileSignatureIcon data-icon="inline-start" />
@@ -863,9 +1654,9 @@ function DashboardView() {
     Math.abs(humanPnl) > 0.01 ? (pnlDelta / Math.abs(humanPnl)) * 100 : 0;
 
   return (
-    <div className="flex flex-col gap-2 p-2 xl:h-full xl:min-h-0">
-      <div className="grid gap-2 xl:h-[604px] xl:grid-cols-[484px_minmax(0,1fr)_438px]">
-        <div className="flex min-h-0 flex-col gap-2">
+    <div className="flex min-w-0 flex-col gap-2 overflow-x-hidden p-2 xl:h-full xl:min-h-0">
+      <div className="grid min-w-0 gap-2 xl:grid-cols-[minmax(0,1fr)_minmax(360px,438px)] 2xl:h-[604px] 2xl:grid-cols-[484px_minmax(320px,1fr)_438px]">
+        <div className="flex min-h-0 min-w-0 flex-col gap-2 xl:col-start-1 xl:row-start-1 2xl:col-auto 2xl:row-auto">
           <DashboardCard
             title="Portfolio Balance (Live)"
             action={
@@ -909,7 +1700,14 @@ function DashboardView() {
               <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0} initialDimension={{ width: 1, height: 1 }}>
                 <LineChart data={metrics.balanceSeries} margin={chartMargins}>
                   <CartesianGrid stroke="#20333b" strokeDasharray="3 3" />
-                  <XAxis dataKey="label" interval={11} tickLine={false} axisLine={false} />
+                  <XAxis
+                    dataKey="label"
+                    fontSize={11}
+                    interval={23}
+                    tickFormatter={formatHourTick}
+                    tickLine={false}
+                    axisLine={false}
+                  />
                   <YAxis domain={[-150, 150]} tickLine={false} axisLine={false} width={42} />
                   <Tooltip
                     contentStyle={{
@@ -969,7 +1767,7 @@ function DashboardView() {
           </DashboardCard>
           <DashboardCard
             title="PnL Waterfall (MTD)"
-            action={<SmallSelectPill>PLN</SmallSelectPill>}
+            action={<SmallInfoPill>{scenario.metadata.currency}</SmallInfoPill>}
             className="xl:h-[280px]"
           >
             <div className="h-[178px]">
@@ -985,10 +1783,10 @@ function DashboardView() {
                     fontSize={10}
                   />
                   <YAxis
-                    tickFormatter={(value) => `${Number(value) / 1000000}M`}
+                    tickFormatter={formatCompactPnlAxis}
                     tickLine={false}
                     axisLine={false}
-                    width={42}
+                    width={48}
                   />
                   <Tooltip
                     formatter={(value) => formatPln(Number(value))}
@@ -1047,13 +1845,13 @@ function DashboardView() {
             </div>
           </DashboardCard>
         </div>
-        <div className="flex min-h-0 flex-col gap-2">
+        <div className="flex min-h-0 min-w-0 flex-col gap-2 xl:col-span-2 xl:row-start-2 2xl:col-auto 2xl:row-auto 2xl:col-span-1">
           <DashboardCard
             title="Forecast vs Actual (Generation/Load)"
             action={
               <div className="flex items-center gap-2">
-                <SmallSelectPill>Today</SmallSelectPill>
-                <SmallSelectPill>MWh</SmallSelectPill>
+                <SmallInfoPill>Today</SmallInfoPill>
+                <SmallInfoPill>MWh</SmallInfoPill>
               </div>
             }
             className="xl:h-[314px]"
@@ -1080,7 +1878,14 @@ function DashboardView() {
               <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0} initialDimension={{ width: 1, height: 1 }}>
                 <LineChart data={forecastData} margin={chartMargins}>
                   <CartesianGrid stroke="#20333b" strokeDasharray="3 3" />
-                  <XAxis dataKey="label" interval={15} tickLine={false} axisLine={false} />
+                  <XAxis
+                    dataKey="label"
+                    fontSize={11}
+                    interval={15}
+                    tickFormatter={formatHourTick}
+                    tickLine={false}
+                    axisLine={false}
+                  />
                   <YAxis
                     tickFormatter={(value) => Number(value).toFixed(0)}
                     tickLine={false}
@@ -1122,87 +1927,124 @@ function DashboardView() {
             action={<Button variant="outline" size="sm" className="h-6 rounded-md text-xs">View all</Button>}
             className="xl:h-[280px]"
           >
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  {["Counterparty", "Product", "Delivery Period", "Volume (MWh)", "Price (PLN/MWh)", "Status", "MtM (PLN)"].map((head) => (
-                    <TableHead key={head} className="h-7 px-1.5 text-[11px] text-muted-foreground">
-                      {head}
-                    </TableHead>
+            <div className="flex flex-col gap-3 md:hidden">
+              {metrics.signedContracts.map((contract) => (
+                <DashboardContractExposureCard contract={contract} key={contract.id} />
+              ))}
+              <div
+                className="min-w-0 rounded-md border border-[#263f49] bg-[#0a1418] p-3"
+                data-testid="mobile-dashboard-contract-total"
+              >
+                <div className="text-xs text-muted-foreground">Total exposure</div>
+                <div className="mt-2 grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-2 text-xs">
+                  <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+                    <div className="text-muted-foreground">Volume</div>
+                    <div className="metric-tabular mt-1 break-words font-medium">
+                      {formatMwh(signedTotals.volumeMwh)}
+                    </div>
+                  </div>
+                  <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+                    <div className="text-muted-foreground">MtM</div>
+                    <div
+                      className={cn(
+                        "metric-tabular mt-1 break-words font-medium",
+                        colorForPnl(signedTotals.mtmPln)
+                      )}
+                    >
+                      {formatPln(signedTotals.mtmPln)}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="hidden -mx-3 overflow-x-auto px-3 md:block">
+              <Table className="min-w-[620px]">
+                <TableHeader>
+                  <TableRow>
+                    {[
+                      "Counterparty",
+                      "Product",
+                      "Delivery Period",
+                      "Volume (MWh)",
+                      `Price (${priceUnitLabel(scenario.metadata.currency)})`,
+                      "Status",
+                      `MtM (${scenario.metadata.currency})`,
+                    ].map((head) => (
+                      <TableHead
+                        key={head}
+                        className="h-7 px-1.5 text-[11px] text-muted-foreground"
+                      >
+                        {head}
+                      </TableHead>
+                    ))}
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {metrics.signedContracts.map((contract) => (
+                    <TableRow key={contract.id}>
+                      <TableCell className="h-8 px-1.5 py-1 text-xs">
+                        {contract.counterparty}
+                      </TableCell>
+                      <TableCell className="h-8 px-1.5 py-1 text-xs font-semibold">
+                        {contract.product}
+                      </TableCell>
+                      <TableCell className="h-8 px-1.5 py-1 text-xs">
+                        {contract.deliveryPeriod}
+                      </TableCell>
+                      <TableCell className="metric-tabular h-8 px-1.5 py-1 text-xs">
+                        {formatMwh(contract.volumeMwh)}
+                      </TableCell>
+                      <TableCell className="metric-tabular h-8 px-1.5 py-1 text-xs">
+                        {contract.pricePlnMwh.toFixed(2)}
+                      </TableCell>
+                      <TableCell className="h-8 px-1.5 py-1 text-xs">
+                        <Badge className="h-5 border border-primary/30 bg-primary/10 px-2 text-[11px] text-primary">
+                          {contract.status}
+                        </Badge>
+                      </TableCell>
+                      <TableCell
+                        className={cn(
+                          "metric-tabular h-8 px-1.5 py-1 text-xs",
+                          colorForPnl(contract.mtmPln)
+                        )}
+                      >
+                        {formatPln(contract.mtmPln)}
+                      </TableCell>
+                    </TableRow>
                   ))}
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {metrics.signedContracts.map((contract) => (
-                  <TableRow key={contract.id}>
-                    <TableCell className="h-8 px-1.5 py-1 text-xs">{contract.counterparty}</TableCell>
-                    <TableCell className="h-8 px-1.5 py-1 text-xs font-semibold">{contract.product}</TableCell>
-                    <TableCell className="h-8 px-1.5 py-1 text-xs">{contract.deliveryPeriod}</TableCell>
+                  <TableRow>
+                    <TableCell className="h-8 px-1.5 py-1 text-xs font-medium">Total</TableCell>
+                    <TableCell />
+                    <TableCell />
                     <TableCell className="metric-tabular h-8 px-1.5 py-1 text-xs">
-                      {formatMwh(contract.volumeMwh)}
+                      {formatMwh(signedTotals.volumeMwh)}
                     </TableCell>
-                    <TableCell className="metric-tabular h-8 px-1.5 py-1 text-xs">
-                      {contract.pricePlnMwh.toFixed(2)}
-                    </TableCell>
-                    <TableCell className="h-8 px-1.5 py-1 text-xs">
-                      <Badge className="h-5 border border-primary/30 bg-primary/10 px-2 text-[11px] text-primary">
-                        {contract.status}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className={cn("metric-tabular h-8 px-1.5 py-1 text-xs", colorForPnl(contract.mtmPln))}>
-                      {formatPln(contract.mtmPln)}
+                    <TableCell />
+                    <TableCell />
+                    <TableCell
+                      className={cn(
+                        "metric-tabular h-8 px-1.5 py-1 text-xs",
+                        colorForPnl(signedTotals.mtmPln)
+                      )}
+                    >
+                      {formatPln(signedTotals.mtmPln)}
                     </TableCell>
                   </TableRow>
-                ))}
-                <TableRow>
-                  <TableCell className="h-8 px-1.5 py-1 text-xs font-medium">Total</TableCell>
-                  <TableCell />
-                  <TableCell />
-                  <TableCell className="metric-tabular h-8 px-1.5 py-1 text-xs">
-                    {formatMwh(signedTotals.volumeMwh)}
-                  </TableCell>
-                  <TableCell />
-                  <TableCell />
-                  <TableCell className={cn("metric-tabular h-8 px-1.5 py-1 text-xs", colorForPnl(signedTotals.mtmPln))}>
-                    {formatPln(signedTotals.mtmPln)}
-                  </TableCell>
-                </TableRow>
-              </TableBody>
-            </Table>
+                </TableBody>
+              </Table>
+            </div>
           </DashboardCard>
         </div>
-        <div className="flex min-h-0 flex-col gap-2">
+        <div className="flex min-h-0 min-w-0 flex-col gap-2 xl:col-start-2 xl:row-start-1 2xl:col-auto 2xl:row-auto">
           <OrderTicket />
           <DashboardCard
             title="Risk & Alerts (Real-time)"
             action={<Button variant="outline" size="sm" className="h-6 rounded-md text-xs">View all</Button>}
             className="xl:h-[192px]"
           >
-            <div className="flex flex-col gap-1">
+            <div className="flex flex-col gap-1.5">
               {metrics.riskAlerts.map((alert) => (
-                <div key={alert.id} className="grid grid-cols-[16px_112px_minmax(0,1fr)_52px] items-center gap-2 rounded-sm px-1 py-0.5 text-[10px] hover:bg-muted/25">
-                  <AlertTriangleIcon
-                    className={cn(
-                      "size-4",
-                      alert.tone === "danger" && "text-[var(--energy-negative)]",
-                      alert.tone === "warning" && "text-[var(--energy-warning)]",
-                      alert.tone === "info" && "text-[var(--energy-cyan)]"
-                    )}
-                    data-icon="inline-start"
-                  />
-                  <span
-                    className={cn(
-                      "font-medium",
-                      alert.tone === "danger" && "text-[var(--energy-negative)]",
-                      alert.tone === "warning" && "text-[var(--energy-warning)]",
-                      alert.tone === "info" && "text-[var(--energy-cyan)]"
-                    )}
-                  >
-                    {alert.title}
-                  </span>
-                  <span className="truncate text-muted-foreground">{alert.description}</span>
-                  <span className="metric-tabular text-right text-muted-foreground">{alert.timeLabel}</span>
-                </div>
+                <RiskAlertRow alert={alert} key={alert.id} />
               ))}
             </div>
           </DashboardCard>
@@ -1212,7 +2054,7 @@ function DashboardView() {
         title="Human vs Algorithm PnL Comparison (MTD)"
         action={
           <div className="flex items-center gap-3">
-            <SmallSelectPill>PLN</SmallSelectPill>
+            <SmallInfoPill>{scenario.metadata.currency}</SmallInfoPill>
             <div className="grid h-7 grid-cols-4 overflow-hidden rounded-md border border-[#2b4550] bg-[#0a1418] text-xs">
               {["MTD", "WTD", "7D", "30D"].map((range, index) => (
                 <button
@@ -1260,12 +2102,19 @@ function DashboardView() {
             <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0} initialDimension={{ width: 1, height: 1 }}>
               <LineChart data={comparisonData} margin={{ left: 0, right: 20, top: 6, bottom: 0 }}>
                 <CartesianGrid stroke="#20333b" strokeDasharray="3 3" />
-                <XAxis dataKey="label" interval={1} tickLine={false} axisLine={false} />
-                <YAxis
-                  tickFormatter={(value) => `${Number(value) / 1000000}M`}
+                <XAxis
+                  dataKey="label"
+                  fontSize={11}
+                  interval={1}
+                  tickFormatter={formatHourTick}
                   tickLine={false}
                   axisLine={false}
-                  width={36}
+                />
+                <YAxis
+                  tickFormatter={formatCompactPnlAxis}
+                  tickLine={false}
+                  axisLine={false}
+                  width={48}
                 />
                 <Tooltip
                   formatter={(value) => formatPln(Number(value))}
@@ -1285,6 +2134,59 @@ function DashboardView() {
     </div>
   );
 }
+
+function DashboardContractExposureCard({ contract }: { contract: DashboardSignedContract }) {
+  return (
+    <div
+      className="min-w-0 rounded-md border border-[#263f49] bg-[#0a1418] p-3"
+      data-testid="mobile-dashboard-contract-card"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="break-words text-sm font-semibold">{contract.product}</div>
+          <div className="mt-1 break-words text-xs text-muted-foreground">
+            {contract.counterparty}
+          </div>
+        </div>
+        <Badge className="h-5 shrink-0 border border-primary/30 bg-primary/10 px-2 text-[11px] text-primary">
+          {contract.status}
+        </Badge>
+      </div>
+      <div className="mt-3 grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-2 text-xs">
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Delivery</div>
+          <div className="metric-tabular mt-1 break-words font-medium">
+            {contract.deliveryPeriod}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Volume</div>
+          <div className="metric-tabular mt-1 break-words font-medium">
+            {formatMwh(contract.volumeMwh)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Price</div>
+          <div className="metric-tabular mt-1 break-words font-medium">
+            {contract.pricePlnMwh.toFixed(2)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">MtM</div>
+          <div
+            className={cn(
+              "metric-tabular mt-1 break-words font-medium",
+              colorForPnl(contract.mtmPln)
+            )}
+          >
+            {formatPln(contract.mtmPln)}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ContractsView() {
   const contracts = useSimulationStore((state) => state.contracts);
   const scenario = useSimulationStore((state) => state.scenario);
@@ -1306,52 +2208,125 @@ function ContractsView() {
           Sign contract
         </Button>
       </div>
-      <Card className="rounded-lg border-border/70 bg-card/80">
-        <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Name</TableHead>
-                <TableHead>Side</TableHead>
-                <TableHead>Type</TableHead>
-                <TableHead>Counterparty</TableHead>
-                <TableHead>Now MWh</TableHead>
-                <TableHead>Price</TableHead>
-                <TableHead>Risk owner</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {contracts.map((contract) => {
-                const current = settleContractsForPeriod(period, [contract], "actual");
-                const volume = contract.side === "buy" ? current.boughtMwh : current.soldMwh;
+      <Card className="min-w-0 rounded-lg border-border/70 bg-card/80">
+        <CardContent className="min-w-0 overflow-hidden">
+          <div className="flex flex-col gap-3 md:hidden">
+            {contracts.map((contract) => (
+              <MobileContractCard contract={contract} key={contract.id} period={period} />
+            ))}
+          </div>
+          <div className="hidden overflow-x-auto md:block">
+            <Table className="min-w-[720px]">
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Name</TableHead>
+                  <TableHead>Side</TableHead>
+                  <TableHead>Type</TableHead>
+                  <TableHead>Counterparty</TableHead>
+                  <TableHead>Now MWh</TableHead>
+                  <TableHead>Price</TableHead>
+                  <TableHead>Risk owner</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {contracts.map((contract) => {
+                  const current = settleContractsForPeriod(period, [contract], "actual");
+                  const volume = contract.side === "buy" ? current.boughtMwh : current.soldMwh;
 
-                return (
-                  <TableRow key={contract.id}>
-                    <TableCell className="font-medium">{contract.name}</TableCell>
-                    <TableCell>
-                      <Badge variant={contract.side === "buy" ? "secondary" : "outline"}>
-                        {contract.side.toUpperCase()}
-                      </Badge>
-                    </TableCell>
-                    <TableCell>{contract.type}</TableCell>
-                    <TableCell>{contract.counterparty}</TableCell>
-                    <TableCell className="metric-tabular">{formatMwh(volume)}</TableCell>
-                    <TableCell className="metric-tabular">
-                      {contract.priceFormula.kind === "fixed"
-                        ? formatPrice(contract.priceFormula.plnPerMwh)
-                        : `Spot ${contract.priceFormula.premium >= 0 ? "+" : ""}${
-                            contract.priceFormula.premium
-                          }`}
-                    </TableCell>
-                    <TableCell>{contract.imbalanceResponsibility}</TableCell>
-                  </TableRow>
-                );
-              })}
-            </TableBody>
-          </Table>
+                  return (
+                    <TableRow key={contract.id}>
+                      <TableCell className="font-medium">{contract.name}</TableCell>
+                      <TableCell>
+                        <Badge variant={contract.side === "buy" ? "secondary" : "outline"}>
+                          {contract.side.toUpperCase()}
+                        </Badge>
+                      </TableCell>
+                      <TableCell>{contract.type}</TableCell>
+                      <TableCell>{contract.counterparty}</TableCell>
+                      <TableCell className="metric-tabular">{formatMwh(volume)}</TableCell>
+                      <TableCell className="metric-tabular">
+                        {formatContractPriceLabel(contract)}
+                      </TableCell>
+                      <TableCell>{contract.imbalanceResponsibility}</TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </div>
         </CardContent>
       </Card>
       <ContractDrawer open={contractDrawerOpen} onOpenChange={setContractDrawerOpen} />
+    </div>
+  );
+}
+
+function formatContractPriceLabel(contract: Contract): string {
+  if (contract.priceFormula.kind === "fixed") {
+    return formatPrice(contract.priceFormula.plnPerMwh);
+  }
+
+  return `Spot ${contract.priceFormula.premium >= 0 ? "+" : ""}${contract.priceFormula.premium}`;
+}
+
+function MobileContractCard({
+  contract,
+  period,
+}: {
+  contract: Contract;
+  period: PeriodSnapshot;
+}) {
+  const current = settleContractsForPeriod(period, [contract], "actual");
+  const volume = contract.side === "buy" ? current.boughtMwh : current.soldMwh;
+
+  return (
+    <div
+      className="min-w-0 rounded-md border border-[#263f49] bg-[#0a1418] p-3"
+      data-testid="mobile-contract-card"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="break-words text-sm font-semibold text-foreground">{contract.name}</div>
+          <div className="mt-1 break-words text-xs text-muted-foreground">
+            {contract.counterparty}
+          </div>
+        </div>
+        <Badge
+          className={cn(
+            "h-5 shrink-0 rounded-md px-2 text-[11px]",
+            contract.side === "buy"
+              ? "border-primary/35 bg-primary/10 text-primary"
+              : "border-[var(--energy-warning)]/35 bg-[var(--energy-warning)]/10 text-[var(--energy-warning)]"
+          )}
+          variant="outline"
+        >
+          {contract.side.toUpperCase()}
+        </Badge>
+      </div>
+      <div className="mt-3 grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-2 text-xs">
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Type</div>
+          <div className="mt-1 break-words text-[12px] font-medium">{contract.type}</div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Now MWh</div>
+          <div className="metric-tabular mt-1 break-words text-[12px] font-medium">
+            {formatMwh(volume)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Price</div>
+          <div className="metric-tabular mt-1 break-words text-[12px] font-medium">
+            {formatContractPriceLabel(contract)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Risk owner</div>
+          <div className="mt-1 break-words text-[12px] font-medium">
+            {contract.imbalanceResponsibility}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1380,6 +2355,66 @@ function decisionToneClass(tone: DecisionLogEntry["tone"]): string {
   }
 
   return "text-muted-foreground";
+}
+
+function replayToneClass(tone: ReplayTimelineEvent["tone"]): string {
+  if (tone === "positive") {
+    return "text-[var(--energy-positive)]";
+  }
+
+  if (tone === "warning") {
+    return "text-[var(--energy-warning)]";
+  }
+
+  if (tone === "negative") {
+    return "text-[var(--energy-negative)]";
+  }
+
+  return "text-muted-foreground";
+}
+
+function replayKindLabel(kind: ReplayTimelineKind | "all"): string {
+  if (kind === "manual-decision") {
+    return "Decisions";
+  }
+
+  if (kind === "bot-edge") {
+    return "Bot edge";
+  }
+
+  if (kind === "imbalance-leak") {
+    return "Imbalance leak";
+  }
+
+  if (kind === "good-hedge") {
+    return "Good hedge";
+  }
+
+  return "All";
+}
+
+function replayEventIcon(kind: ReplayTimelineKind): LucideIcon {
+  if (kind === "bot-edge") {
+    return BotIcon;
+  }
+
+  if (kind === "imbalance-leak") {
+    return AlertTriangleIcon;
+  }
+
+  if (kind === "good-hedge") {
+    return ShieldCheckIcon;
+  }
+
+  return FileSignatureIcon;
+}
+
+function formatMaybePln(value?: number): string {
+  return value === undefined ? "n/a" : formatPln(value);
+}
+
+function formatMaybeMwh(value?: number): string {
+  return value === undefined ? "n/a" : formatMwh(value);
 }
 
 function insightCategoryLabel(category: StrategyDuelInsight["category"]): string {
@@ -1423,52 +2458,77 @@ function DecisionLogPanel({ decisionLog }: { decisionLog: DecisionLogEntry[] }) 
             No manual decisions yet.
           </div>
         ) : (
-          <div className="flex flex-col gap-2">
-            {entries.map((entry) => (
-              <div
-                key={entry.id}
-                className="rounded-lg border border-border/70 bg-muted/30 p-3 text-xs"
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <div className={cn("font-medium", decisionToneClass(entry.tone))}>
-                      {entry.title}
+          <div aria-live="polite" className="flex flex-col gap-2">
+            {entries.map((entry, index) => {
+              const isLatest = index === 0;
+
+              return (
+                <motion.div
+                  key={entry.id}
+                  data-latest={isLatest ? "true" : "false"}
+                  data-testid="decision-log-entry"
+                  className="rounded-lg border border-border/70 bg-muted/30 p-3 text-xs"
+                  initial={
+                    isLatest
+                      ? {
+                          borderColor: "var(--primary)",
+                          boxShadow: "0 0 0 1px rgba(93, 232, 154, 0.36)",
+                          scale: 1.01,
+                        }
+                      : false
+                  }
+                  animate={
+                    isLatest
+                      ? {
+                          borderColor: "var(--border)",
+                          boxShadow: "0 0 0 0 rgba(93, 232, 154, 0)",
+                          scale: 1,
+                        }
+                      : undefined
+                  }
+                  transition={{ duration: 0.7, ease: "easeOut" }}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className={cn("font-medium", decisionToneClass(entry.tone))}>
+                        {entry.title}
+                      </div>
+                      <div className="mt-1 text-muted-foreground">{entry.summary}</div>
                     </div>
-                    <div className="mt-1 text-muted-foreground">{entry.summary}</div>
-                  </div>
-                  <div className="metric-tabular shrink-0 text-muted-foreground">
-                    {entry.createdAtLabel}
-                  </div>
-                </div>
-                <div className="mt-3 grid grid-cols-3 gap-2 border-t border-border/70 pt-2">
-                  <div>
-                    <div className="text-muted-foreground">Impact</div>
-                    <div className={cn("metric-tabular font-medium", colorForPnl(entry.pnlImpact))}>
-                      {formatPln(entry.pnlImpact)}
+                    <div className="metric-tabular shrink-0 text-muted-foreground">
+                      {entry.createdAtLabel}
                     </div>
                   </div>
-                  <div>
-                    <div className="text-muted-foreground">Risk cut</div>
-                    <div
-                      className={cn(
-                        "metric-tabular font-medium",
-                        entry.imbalanceReductionMwh > 0
-                          ? "text-[var(--energy-positive)]"
-                          : entry.imbalanceReductionMwh < 0
-                            ? "text-[var(--energy-negative)]"
-                            : "text-muted-foreground"
-                      )}
-                    >
-                      {formatSignedMwh(entry.imbalanceReductionMwh)}
+                  <div className="mt-3 grid grid-cols-3 gap-2 border-t border-border/70 pt-2">
+                    <div>
+                      <div className="text-muted-foreground">Impact</div>
+                      <div className={cn("metric-tabular font-medium", colorForPnl(entry.pnlImpact))}>
+                        {formatPln(entry.pnlImpact)}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-muted-foreground">Risk cut</div>
+                      <div
+                        className={cn(
+                          "metric-tabular font-medium",
+                          entry.imbalanceReductionMwh > 0
+                            ? "text-[var(--energy-positive)]"
+                            : entry.imbalanceReductionMwh < 0
+                              ? "text-[var(--energy-negative)]"
+                              : "text-muted-foreground"
+                        )}
+                      >
+                        {formatSignedMwh(entry.imbalanceReductionMwh)}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-muted-foreground">Price</div>
+                      <div className="font-medium capitalize">{entry.priceQuality}</div>
                     </div>
                   </div>
-                  <div>
-                    <div className="text-muted-foreground">Price</div>
-                    <div className="font-medium capitalize">{entry.priceQuality}</div>
-                  </div>
-                </div>
-              </div>
-            ))}
+                </motion.div>
+              );
+            })}
           </div>
         )}
       </CardContent>
@@ -1499,44 +2559,104 @@ function DuelInsightsTable({
             No material bot edge found for the current manual book.
           </div>
         ) : (
-          <ScrollArea className="h-[304px]">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Period</TableHead>
-                  <TableHead>Finding</TableHead>
-                  <TableHead>Manual PnL</TableHead>
-                  <TableHead>Script PnL</TableHead>
-                  <TableHead>Opportunity</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
+          <>
+            <ScrollArea className="h-[304px] md:hidden">
+              <div className="flex flex-col gap-3 pr-3">
                 {insights.map((insight) => (
-                  <TableRow key={insight.id}>
-                    <TableCell className="metric-tabular font-medium">{insight.label}</TableCell>
-                    <TableCell>
-                      <div className="font-medium">{insightCategoryLabel(insight.category)}</div>
-                      <div className="max-w-[260px] text-xs text-muted-foreground">
-                        {insight.description}
-                      </div>
-                    </TableCell>
-                    <TableCell className={cn("metric-tabular", colorForPnl(insight.manualPnl))}>
-                      {formatPln(insight.manualPnl)}
-                    </TableCell>
-                    <TableCell className={cn("metric-tabular", colorForPnl(insight.scriptPnl))}>
-                      {formatPln(insight.scriptPnl)}
-                    </TableCell>
-                    <TableCell className="metric-tabular text-[var(--energy-positive)]">
-                      {formatPln(insight.opportunityPln)}
-                    </TableCell>
-                  </TableRow>
+                  <MobileDuelInsightCard insight={insight} key={insight.id} />
                 ))}
-              </TableBody>
-            </Table>
-          </ScrollArea>
+              </div>
+            </ScrollArea>
+            <div className="hidden overflow-x-auto md:block">
+              <ScrollArea className="h-[304px]">
+                <Table className="min-w-[700px]">
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Period</TableHead>
+                      <TableHead>Finding</TableHead>
+                      <TableHead>Manual PnL</TableHead>
+                      <TableHead>Script PnL</TableHead>
+                      <TableHead>Opportunity</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {insights.map((insight) => (
+                      <TableRow key={insight.id}>
+                        <TableCell className="metric-tabular font-medium">
+                          {insight.label}
+                        </TableCell>
+                        <TableCell>
+                          <div className="font-medium">
+                            {insightCategoryLabel(insight.category)}
+                          </div>
+                          <div className="max-w-[260px] text-xs text-muted-foreground">
+                            {insight.description}
+                          </div>
+                        </TableCell>
+                        <TableCell className={cn("metric-tabular", colorForPnl(insight.manualPnl))}>
+                          {formatPln(insight.manualPnl)}
+                        </TableCell>
+                        <TableCell className={cn("metric-tabular", colorForPnl(insight.scriptPnl))}>
+                          {formatPln(insight.scriptPnl)}
+                        </TableCell>
+                        <TableCell className="metric-tabular text-[var(--energy-positive)]">
+                          {formatPln(insight.opportunityPln)}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </ScrollArea>
+            </div>
+          </>
         )}
       </CardContent>
     </Card>
+  );
+}
+
+function MobileDuelInsightCard({ insight }: { insight: StrategyDuelInsight }) {
+  return (
+    <div
+      className="min-w-0 rounded-md border border-[#263f49] bg-[#0a1418] p-3"
+      data-testid="mobile-duel-insight-card"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="metric-tabular text-sm font-semibold">{insight.label}</div>
+          <div className="mt-1 break-words text-xs font-medium">
+            {insightCategoryLabel(insight.category)}
+          </div>
+        </div>
+        <Badge
+          variant="outline"
+          className="h-5 shrink-0 rounded-md border-primary/35 bg-primary/10 px-2 text-[11px] text-primary"
+        >
+          Edge
+        </Badge>
+      </div>
+      <p className="mt-2 break-words text-xs text-muted-foreground">{insight.description}</p>
+      <div className="mt-3 grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-2 text-xs">
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Manual PnL</div>
+          <div className={cn("metric-tabular mt-1 break-words font-medium", colorForPnl(insight.manualPnl))}>
+            {formatPln(insight.manualPnl)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Script PnL</div>
+          <div className={cn("metric-tabular mt-1 break-words font-medium", colorForPnl(insight.scriptPnl))}>
+            {formatPln(insight.scriptPnl)}
+          </div>
+        </div>
+        <div className="col-span-2 min-w-0 rounded-md border border-primary/30 bg-primary/10 p-2">
+          <div className="text-primary/80">Opportunity</div>
+          <div className="metric-tabular mt-1 break-words font-medium text-primary">
+            {formatPln(insight.opportunityPln)}
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1638,7 +2758,7 @@ function DecisionWorkbench() {
   }
 
   return (
-    <Card className="rounded-lg border-border/70 bg-card/80">
+    <Card className="rounded-lg border-border/70 bg-card/80" data-testid="decision-workbench">
       <CardHeader>
         <CardTitle>Decision workbench</CardTitle>
         <CardDescription>Next 12 periods by expected imbalance and RDB impact</CardDescription>
@@ -1676,69 +2796,177 @@ function DecisionWorkbench() {
           </div>
         ) : null}
         <ScrollArea className="h-[294px]">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Period</TableHead>
-                <TableHead>Net</TableHead>
-                <TableHead>Imb. PnL</TableHead>
-                <TableHead>RDB</TableHead>
-                <TableHead>Decision</TableHead>
-                <TableHead>Impact</TableHead>
-                <TableHead />
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {candidates.map((candidate) => (
-                <TableRow key={candidate.periodIndex}>
-                  <TableCell className="metric-tabular font-medium">{candidate.label}</TableCell>
-                  <TableCell className="metric-tabular">
-                    {formatSignedMwh(candidate.expectedNetMwh)}
-                  </TableCell>
-                  <TableCell
-                    className={cn("metric-tabular", colorForPnl(candidate.expectedImbalancePnl))}
-                  >
-                    {formatPln(candidate.expectedImbalancePnl)}
-                  </TableCell>
-                  <TableCell className="metric-tabular">
-                    {formatPrice(
-                      candidate.recommendation === "sell" ? candidate.rdbBid : candidate.rdbAsk
-                    )}
-                  </TableCell>
-                  <TableCell>
-                    <Badge
-                      variant={candidate.recommendation === "hold" ? "outline" : "secondary"}
-                      className={cn(
-                        "h-5 rounded-md px-2 text-[11px]",
-                        candidate.recommendation === "buy" && "text-primary",
-                        candidate.recommendation === "sell" && "text-[var(--energy-warning)]"
-                      )}
-                    >
-                      {recommendationLabel(candidate)}
-                    </Badge>
-                  </TableCell>
-                  <TableCell
-                    className={cn("metric-tabular", colorForPnl(candidate.expectedPnlImpact))}
-                  >
-                    {formatPln(candidate.expectedPnlImpact)}
-                  </TableCell>
-                  <TableCell className="text-right">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      disabled={!candidate.orderDraft}
-                      onClick={() => loadCandidate(candidate)}
-                    >
-                      Load
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+          <div className="flex flex-col gap-3 pr-3">
+            {candidates.map((candidate) => (
+              <DecisionCandidateCard
+                candidate={candidate}
+                key={candidate.periodIndex}
+                onLoad={loadCandidate}
+              />
+            ))}
+          </div>
         </ScrollArea>
       </CardContent>
     </Card>
+  );
+}
+
+function DecisionCandidateCard({
+  candidate,
+  onLoad,
+}: {
+  candidate: DecisionCandidate;
+  onLoad: (candidate: DecisionCandidate) => void;
+}) {
+  return (
+    <div
+      className="min-w-0 rounded-md border border-[#263f49] bg-[#0a1418] p-2.5"
+      data-testid="decision-candidate-card"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="text-xs text-muted-foreground">Period</div>
+          <div className="metric-tabular mt-1 text-sm font-semibold">{candidate.label}</div>
+        </div>
+        <div className="flex shrink-0 flex-col items-end gap-2">
+          <Badge
+            variant={candidate.recommendation === "hold" ? "outline" : "secondary"}
+            className={cn(
+              "h-5 shrink-0 rounded-md px-2 text-[11px]",
+              candidate.recommendation === "buy" && "text-primary",
+              candidate.recommendation === "sell" && "text-[var(--energy-warning)]"
+            )}
+          >
+            {recommendationLabel(candidate)}
+          </Badge>
+          <Button
+            className="h-7 px-3"
+            disabled={!candidate.orderDraft}
+            size="sm"
+            variant="secondary"
+            onClick={() => onLoad(candidate)}
+          >
+            Load
+          </Button>
+        </div>
+      </div>
+      <div className="mt-2 grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-2 text-xs">
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Net</div>
+          <div className="metric-tabular mt-1 break-words font-medium">
+            {formatSignedMwh(candidate.expectedNetMwh)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Imb. PnL</div>
+          <div
+            className={cn(
+              "metric-tabular mt-1 break-words font-medium",
+              colorForPnl(candidate.expectedImbalancePnl)
+            )}
+          >
+            {formatPln(candidate.expectedImbalancePnl)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">RDB</div>
+          <div className="metric-tabular mt-1 break-words font-medium">
+            {formatPrice(candidate.recommendation === "sell" ? candidate.rdbBid : candidate.rdbAsk)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Impact</div>
+          <div
+            className={cn(
+              "metric-tabular mt-1 break-words font-medium",
+              colorForPnl(candidate.expectedPnlImpact)
+            )}
+          >
+            {formatPln(candidate.expectedPnlImpact)}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MobileMarketPeriodCard({
+  currentPeriod,
+  onSelectPeriod,
+  period,
+}: {
+  currentPeriod: number;
+  onSelectPeriod: (periodIndex: number) => void;
+  period: KnownPeriodView;
+}) {
+  const isLocked = period.periodIndex <= currentPeriod;
+
+  return (
+    <div
+      className="min-w-0 max-w-full rounded-md border border-[#263f49] bg-[#0a1418] p-3"
+      data-testid="mobile-market-period-card"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="metric-tabular text-base font-semibold">{period.label}</div>
+          <div className="metric-tabular mt-1 text-xs text-muted-foreground">
+            RDN {formatPrice(period.rdnPrice)}
+          </div>
+        </div>
+        <Badge
+          className={cn(
+            "h-5 rounded-md px-2 text-[11px]",
+            isLocked
+              ? "border-muted bg-muted/20 text-muted-foreground"
+              : "border-primary/35 bg-primary/10 text-primary"
+          )}
+          variant="outline"
+        >
+          {isLocked ? "Locked" : "Tradable"}
+        </Badge>
+      </div>
+      <div className="mt-3 grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-2 text-xs">
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Bid</div>
+          <div className="metric-tabular mt-1 break-words text-[12px] font-semibold text-[var(--energy-positive)]">
+            {formatPrice(period.intradayBid)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Ask</div>
+          <div className="metric-tabular mt-1 break-words text-[12px] font-semibold text-[var(--energy-negative)]">
+            {formatPrice(period.intradayAsk)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Long imb.</div>
+          <div className="metric-tabular mt-1 break-words text-[12px]">
+            {formatPrice(period.actualImbalanceLongPrice ?? period.expectedImbalanceLongPrice)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Short imb.</div>
+          <div className="metric-tabular mt-1 break-words text-[12px]">
+            {formatPrice(period.actualImbalanceShortPrice ?? period.expectedImbalanceShortPrice)}
+          </div>
+        </div>
+      </div>
+      <div className="mt-3 grid grid-cols-[1fr_auto] items-center gap-3">
+        <div>
+          <div className="text-xs text-muted-foreground">Liquidity</div>
+          <div className="metric-tabular text-sm font-semibold">{formatMwh(period.liquidityMwh)}</div>
+        </div>
+        <Button
+          disabled={isLocked}
+          onClick={() => onSelectPeriod(period.periodIndex)}
+          size="sm"
+          type="button"
+          variant={isLocked ? "outline" : "secondary"}
+        >
+          {isLocked ? "Locked" : "Load ticket"}
+        </Button>
+      </div>
+    </div>
   );
 }
 
@@ -1754,14 +2982,29 @@ function MarketView() {
   );
 
   return (
-    <div className="grid flex-1 gap-4 p-4 md:p-6 xl:grid-cols-[minmax(0,1fr)_360px]">
-      <Card className="rounded-lg border-border/70 bg-card/80">
+    <div className="grid min-w-0 flex-1 grid-cols-[minmax(0,1fr)] gap-4 overflow-x-hidden p-4 md:p-6 xl:grid-cols-[minmax(0,1fr)_360px]">
+      <Card className="w-full min-w-0 max-w-full rounded-lg border-border/70 bg-card/80">
         <CardHeader>
           <CardTitle>Intraday market board</CardTitle>
           <CardDescription>Locked RDN reference plus RDB/SIDC executable liquidity</CardDescription>
         </CardHeader>
-        <CardContent>
-          <Table>
+        <CardContent className="w-full min-w-0 max-w-full overflow-hidden">
+          <div className="md:hidden">
+            <ScrollArea className="h-[520px] w-full max-w-full overflow-hidden pr-3">
+              <div className="flex w-full min-w-0 max-w-full flex-col gap-3">
+                {periods.map((period) => (
+                  <MobileMarketPeriodCard
+                    currentPeriod={currentPeriod}
+                    key={period.periodIndex}
+                    onSelectPeriod={setSelectedPeriod}
+                    period={period}
+                  />
+                ))}
+              </div>
+            </ScrollArea>
+          </div>
+          <div className="hidden overflow-x-auto md:block">
+            <Table className="min-w-[920px]">
             <TableHeader>
               <TableRow>
                 <TableHead>Period</TableHead>
@@ -1810,6 +3053,7 @@ function MarketView() {
               ))}
             </TableBody>
           </Table>
+          </div>
         </CardContent>
       </Card>
       <div className="flex flex-col gap-4">
@@ -1822,33 +3066,185 @@ function MarketView() {
   );
 }
 
+function ScenarioRangeControl({
+  control,
+  value,
+  onChange,
+}: {
+  control: (typeof scenarioRangeControls)[number];
+  value: number;
+  onChange: (value: number) => void;
+}) {
+  const controlId = `scenario-${control.key}`;
+
+  return (
+    <div className="rounded-md border border-border/60 bg-background/35 p-3">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <label className="text-xs font-medium text-muted-foreground" htmlFor={controlId}>
+          {control.label}
+        </label>
+        <span className="metric-tabular text-xs font-semibold text-foreground">
+          {control.formatValue(value)}
+        </span>
+      </div>
+      <input
+        aria-label={control.label}
+        className="h-2 w-full accent-[var(--energy-cyan)]"
+        id={controlId}
+        max={control.max}
+        min={control.min}
+        onChange={(event) => onChange(Number(event.target.value))}
+        step={control.step}
+        type="range"
+        value={value}
+      />
+    </div>
+  );
+}
+
+function CalibrationMetric({
+  label,
+  value,
+  delta,
+}: {
+  label: string;
+  value: string;
+  delta: string;
+}) {
+  return (
+    <div className="rounded-md border border-border/60 bg-background/35 p-3">
+      <div className="text-[11px] uppercase tracking-normal text-muted-foreground">{label}</div>
+      <div className="mt-1 metric-tabular text-sm font-semibold text-foreground">{value}</div>
+      <div className="mt-1 metric-tabular text-[11px] text-muted-foreground">{delta}</div>
+    </div>
+  );
+}
+
+function buildCalibrationRows(
+  activeReport: ScenarioCalibrationReport,
+  previewReport: ScenarioCalibrationReport,
+  currency: CurrencyCode
+) {
+  return [
+    {
+      label: "Avg RDN",
+      value: formatPrice(previewReport.averageRdnPrice, currency),
+      delta: formatSignedDelta(
+        previewReport.averageRdnPrice - activeReport.averageRdnPrice,
+        ` ${priceUnitLabel(currency)}`
+      ),
+    },
+    {
+      label: "RDN sigma",
+      value: formatPrice(previewReport.rdnPriceStdDev, currency),
+      delta: formatSignedDelta(
+        previewReport.rdnPriceStdDev - activeReport.rdnPriceStdDev,
+        ` ${priceUnitLabel(currency)}`
+      ),
+    },
+    {
+      label: "Negative 15m",
+      value: `${previewReport.negativeRdnPeriods}`,
+      delta: formatSignedDelta(
+        previewReport.negativeRdnPeriods - activeReport.negativeRdnPeriods,
+        " periods"
+      ),
+    },
+    {
+      label: "Avg liquidity",
+      value: formatMwh(previewReport.averageLiquidityMwh),
+      delta: formatSignedDelta(
+        previewReport.averageLiquidityMwh - activeReport.averageLiquidityMwh,
+        " MWh",
+        1
+      ),
+    },
+    {
+      label: "Max spread",
+      value: formatPrice(previewReport.maxBidAskSpread, currency),
+      delta: formatSignedDelta(
+        previewReport.maxBidAskSpread - activeReport.maxBidAskSpread,
+        ` ${priceUnitLabel(currency)}`
+      ),
+    },
+    {
+      label: "Spike trigger",
+      value: formatPrice(previewReport.priceSpikeThreshold, currency),
+      delta: formatSignedDelta(
+        previewReport.priceSpikeThreshold - activeReport.priceSpikeThreshold,
+        ` ${priceUnitLabel(currency)}`
+      ),
+    },
+  ];
+}
+
 function ForecastView() {
+  const scenarioId = useSimulationStore((state) => state.scenarioId);
   const scenario = useSimulationStore((state) => state.scenario);
+  const scenarioConfig = useSimulationStore((state) => state.scenarioConfig);
+  const scenarioConfigDraft = useSimulationStore((state) => state.scenarioConfigDraft);
+  const updateScenarioConfigDraft = useSimulationStore(
+    (state) => state.updateScenarioConfigDraft
+  );
+  const applyScenarioConfig = useSimulationStore((state) => state.applyScenarioConfig);
+  const resetScenarioConfig = useSimulationStore((state) => state.resetScenarioConfig);
   const currentPeriod = useSimulationStore((state) => state.currentPeriod);
   const data = buildKnownMarketTape(scenario, currentPeriod)
     .slice(currentPeriod, currentPeriod + 48)
     .map((period) => ({
-    label: period.label,
-    forecastGeneration: period.forecastGeneration,
-    actualGeneration: period.actualGeneration,
-    forecastLoad: period.forecastLoad,
-    actualLoad: period.actualLoad,
-    wind: period.weather.windSpeedMs,
-    irradiance: period.weather.irradiance / 50,
-    temperature: period.weather.temperatureC,
-  }));
+      label: period.label,
+      forecastGeneration: period.forecastGeneration,
+      actualGeneration: period.actualGeneration,
+      forecastLoad: period.forecastLoad,
+      actualLoad: period.actualLoad,
+      wind: period.weather.windSpeedMs,
+      irradiance: period.weather.irradiance / 50,
+      temperature: period.weather.temperatureC,
+    }));
+  const activeReport = useMemo(
+    () => buildScenarioCalibrationReport(scenario),
+    [scenario]
+  );
+  const previewScenario = useMemo(
+    () => createScenario(scenarioId, scenarioConfigDraft),
+    [scenarioId, scenarioConfigDraft]
+  );
+  const previewReport = useMemo(
+    () => buildScenarioCalibrationReport(previewScenario),
+    [previewScenario]
+  );
+  const calibrationRows = useMemo(
+    () => buildCalibrationRows(activeReport, previewReport, scenario.metadata.currency),
+    [activeReport, previewReport, scenario.metadata.currency]
+  );
+  const defaultConfig = useMemo(
+    () => createDefaultScenarioConfig(scenarioId),
+    [scenarioId]
+  );
+  const hasDraftChanges = !configsEqual(scenarioConfig, scenarioConfigDraft);
+  const isDefaultConfig =
+    configsEqual(scenarioConfig, defaultConfig) &&
+    configsEqual(scenarioConfigDraft, defaultConfig);
 
   return (
-    <div className="grid flex-1 gap-4 p-4 md:p-6 xl:grid-cols-[minmax(0,1fr)_360px]">
+    <div className="grid flex-1 gap-4 p-4 md:p-6 xl:grid-cols-[minmax(0,1fr)_390px]">
       <div className="flex flex-col gap-4">
         <Card className="rounded-lg border-border/70 bg-card/80">
           <CardHeader>
             <CardTitle>Weather-driven OZE and load forecast</CardTitle>
-            <CardDescription>PV follows irradiance and cloud cover; load follows time and temperature</CardDescription>
+            <CardDescription>
+              PV follows irradiance and cloud cover; load follows time and temperature
+            </CardDescription>
           </CardHeader>
           <CardContent>
             <div className="h-80">
-              <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0} initialDimension={{ width: 1, height: 1 }}>
+              <ResponsiveContainer
+                width="100%"
+                height="100%"
+                minWidth={0}
+                minHeight={0}
+                initialDimension={{ width: 1, height: 1 }}
+              >
                 <LineChart data={data} margin={{ left: 0, right: 8, top: 10, bottom: 0 }}>
                   <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" />
                   <XAxis dataKey="label" tickLine={false} axisLine={false} minTickGap={24} />
@@ -1860,10 +3256,32 @@ function ForecastView() {
                       borderRadius: 8,
                     }}
                   />
-                  <Line dataKey="forecastGeneration" name="Forecast OZE" stroke="var(--energy-cyan)" dot={false} />
-                  <Line dataKey="actualGeneration" name="Actual OZE" stroke="var(--energy-positive)" dot={false} strokeWidth={2} />
-                  <Line dataKey="forecastLoad" name="Forecast load" stroke="var(--energy-amber)" dot={false} />
-                  <Line dataKey="actualLoad" name="Actual load" stroke="var(--energy-negative)" dot={false} strokeWidth={2} />
+                  <Line
+                    dataKey="forecastGeneration"
+                    name="Forecast OZE"
+                    stroke="var(--energy-cyan)"
+                    dot={false}
+                  />
+                  <Line
+                    dataKey="actualGeneration"
+                    name="Actual OZE"
+                    stroke="var(--energy-positive)"
+                    dot={false}
+                    strokeWidth={2}
+                  />
+                  <Line
+                    dataKey="forecastLoad"
+                    name="Forecast load"
+                    stroke="var(--energy-amber)"
+                    dot={false}
+                  />
+                  <Line
+                    dataKey="actualLoad"
+                    name="Actual load"
+                    stroke="var(--energy-negative)"
+                    dot={false}
+                    strokeWidth={2}
+                  />
                 </LineChart>
               </ResponsiveContainer>
             </div>
@@ -1876,7 +3294,13 @@ function ForecastView() {
           </CardHeader>
           <CardContent>
             <div className="h-72">
-              <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0} initialDimension={{ width: 1, height: 1 }}>
+              <ResponsiveContainer
+                width="100%"
+                height="100%"
+                minWidth={0}
+                minHeight={0}
+                initialDimension={{ width: 1, height: 1 }}
+              >
                 <AreaChart data={data} margin={{ left: 0, right: 8, top: 10, bottom: 0 }}>
                   <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" />
                   <XAxis dataKey="label" tickLine={false} axisLine={false} minTickGap={24} />
@@ -1888,27 +3312,155 @@ function ForecastView() {
                       borderRadius: 8,
                     }}
                   />
-                  <Area dataKey="irradiance" name="Irradiance index" stroke="var(--energy-warning)" fill="var(--energy-warning)" fillOpacity={0.18} />
-                  <Area dataKey="wind" name="Wind m/s" stroke="var(--energy-cyan)" fill="var(--energy-cyan)" fillOpacity={0.12} />
-                  <Area dataKey="temperature" name="Temp C" stroke="var(--energy-negative)" fill="var(--energy-negative)" fillOpacity={0.1} />
+                  <Area
+                    dataKey="irradiance"
+                    name="Irradiance index"
+                    stroke="var(--energy-warning)"
+                    fill="var(--energy-warning)"
+                    fillOpacity={0.18}
+                  />
+                  <Area
+                    dataKey="wind"
+                    name="Wind m/s"
+                    stroke="var(--energy-cyan)"
+                    fill="var(--energy-cyan)"
+                    fillOpacity={0.12}
+                  />
+                  <Area
+                    dataKey="temperature"
+                    name="Temp C"
+                    stroke="var(--energy-negative)"
+                    fill="var(--energy-negative)"
+                    fillOpacity={0.1}
+                  />
                 </AreaChart>
               </ResponsiveContainer>
             </div>
           </CardContent>
         </Card>
       </div>
-      <Card className="rounded-lg border-border/70 bg-card/80">
-        <CardHeader>
-          <CardTitle>Forecast rulebook</CardTitle>
-          <CardDescription>What v1 intentionally models</CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-3 text-sm text-muted-foreground">
-          <p>PV production changes with irradiance and cloud cover, then actual metering applies a scenario-specific forecast error.</p>
-          <p>Wind follows a smooth speed curve with sudden ramp shocks in selected scenarios.</p>
-          <p>Load rises in morning and evening peaks, with winter temperature sensitivity.</p>
-          <p>Prices react to scarcity, OZE surplus, evening peaks, outage shocks and intraday liquidity.</p>
-        </CardContent>
-      </Card>
+      <div className="flex min-w-0 flex-col gap-4">
+        <Card className="rounded-lg border-border/70 bg-card/80" data-testid="scenario-editor">
+          <CardHeader className="gap-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <CardTitle>Scenario editor</CardTitle>
+                <CardDescription>
+                  Seed {scenarioConfig.seed} · {scenario.definition.shortName}
+                </CardDescription>
+              </div>
+              <Badge
+                className={cn(
+                  "shrink-0",
+                  hasDraftChanges
+                    ? "border-[var(--energy-warning)] text-[var(--energy-warning)]"
+                    : "border-[var(--energy-positive)] text-[var(--energy-positive)]"
+                )}
+                variant="outline"
+              >
+                {hasDraftChanges ? "Draft" : "Live"}
+              </Badge>
+            </div>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3">
+            <div className="rounded-md border border-border/60 bg-background/35 p-3">
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <label className="text-xs font-medium text-muted-foreground" htmlFor="scenario-seed">
+                  Seed
+                </label>
+                <span className="metric-tabular text-xs text-muted-foreground">
+                  active {scenarioConfig.seed}
+                </span>
+              </div>
+              <Input
+                aria-label="Scenario seed"
+                id="scenario-seed"
+                max={999999}
+                min={1}
+                onChange={(event) =>
+                  updateScenarioConfigDraft({ seed: Math.trunc(Number(event.target.value)) })
+                }
+                type="number"
+                value={scenarioConfigDraft.seed}
+              />
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              {scenarioRangeControls.map((control) => (
+                <ScenarioRangeControl
+                  control={control}
+                  key={control.key}
+                  onChange={(value) =>
+                    updateScenarioConfigDraft({
+                      [control.key]: value,
+                    } as Partial<ScenarioConfig>)
+                  }
+                  value={scenarioConfigDraft[control.key]}
+                />
+              ))}
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <Button
+                disabled={!hasDraftChanges}
+                onClick={applyScenarioConfig}
+                type="button"
+                variant={hasDraftChanges ? "default" : "outline"}
+              >
+                {hasDraftChanges ? (
+                  <SparklesIcon data-icon="inline-start" />
+                ) : (
+                  <ShieldCheckIcon data-icon="inline-start" />
+                )}
+                {hasDraftChanges ? "Apply scenario" : "Applied"}
+              </Button>
+              <Button
+                disabled={isDefaultConfig}
+                onClick={resetScenarioConfig}
+                type="button"
+                variant="outline"
+              >
+                <RotateCcwIcon data-icon="inline-start" />
+                Reset defaults
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+        <Card className="rounded-lg border-border/70 bg-card/80">
+          <CardHeader>
+            <CardTitle>Calibration preview</CardTitle>
+            <CardDescription>Draft tape vs active tape</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="grid gap-3 sm:grid-cols-2">
+              {calibrationRows.map((row) => (
+                <CalibrationMetric
+                  delta={row.delta}
+                  key={row.label}
+                  label={row.label}
+                  value={row.value}
+                />
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+        <Card className="rounded-lg border-border/70 bg-card/80">
+          <CardHeader>
+            <CardTitle>Forecast rulebook</CardTitle>
+            <CardDescription>What v1 intentionally models</CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3 text-sm text-muted-foreground">
+            <p>
+              PV production changes with irradiance and cloud cover, then actual metering applies
+              a scenario-specific forecast error.
+            </p>
+            <p>Wind follows a smooth speed curve with sudden ramp shocks in selected scenarios.</p>
+            <p>Load rises in morning and evening peaks, with winter temperature sensitivity.</p>
+            <p>
+              Prices react to scarcity, OZE surplus, evening peaks, outage shocks and intraday
+              liquidity.
+            </p>
+          </CardContent>
+        </Card>
+      </div>
     </div>
   );
 }
@@ -2004,33 +3556,49 @@ function DuelView() {
             <CardTitle>Decision quality</CardTitle>
             <CardDescription>Imbalance cost and risk mistakes</CardDescription>
           </CardHeader>
-          <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Player</TableHead>
-                  <TableHead>Total PnL</TableHead>
-                  <TableHead>Imbalance PnL</TableHead>
-                  <TableHead>Abs imbalance</TableHead>
-                  <TableHead>Risk periods</TableHead>
-                  <TableHead>Worst period</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                <ComparisonRow
-                  label="Manual"
-                  settlement={human}
-                  tradeCount={manualRdbTrades.length}
+          <CardContent className="space-y-3">
+            <div className="grid gap-3 md:hidden">
+              <ComparisonSummaryCard
+                label="Manual"
+                settlement={human}
+                tradeCount={manualRdbTrades.length}
+              />
+              {botProjectedSettlement ? (
+                <ComparisonSummaryCard
+                  label="Script"
+                  settlement={botProjectedSettlement}
+                  tradeCount={botResult?.trades.length ?? 0}
                 />
-                {botProjectedSettlement ? (
+              ) : null}
+            </div>
+            <div className="hidden overflow-x-auto md:block">
+              <Table className="min-w-[700px]">
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Player</TableHead>
+                    <TableHead>Total PnL</TableHead>
+                    <TableHead>Imbalance PnL</TableHead>
+                    <TableHead>Abs imbalance</TableHead>
+                    <TableHead>Risk periods</TableHead>
+                    <TableHead>Worst period</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
                   <ComparisonRow
-                    label="Script"
-                    settlement={botProjectedSettlement}
-                    tradeCount={botResult?.trades.length ?? 0}
+                    label="Manual"
+                    settlement={human}
+                    tradeCount={manualRdbTrades.length}
                   />
-                ) : null}
-              </TableBody>
-            </Table>
+                  {botProjectedSettlement ? (
+                    <ComparisonRow
+                      label="Script"
+                      settlement={botProjectedSettlement}
+                      tradeCount={botResult?.trades.length ?? 0}
+                    />
+                  ) : null}
+                </TableBody>
+              </Table>
+            </div>
           </CardContent>
         </Card>
         <DuelInsightsTable insights={duelInsights} hasBotResult={Boolean(botResult)} />
@@ -2096,72 +3664,484 @@ function ComparisonRow({
   );
 }
 
+function ComparisonSummaryCard({
+  label,
+  settlement,
+  tradeCount,
+}: {
+  label: string;
+  settlement: ReturnType<typeof settlePortfolio>;
+  tradeCount: number;
+}) {
+  return (
+    <div
+      className="min-w-0 rounded-md border border-[#263f49] bg-[#0a1418] p-3"
+      data-testid="mobile-duel-comparison-card"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="text-sm font-semibold">{label}</div>
+          <div className="mt-1 text-xs text-muted-foreground">{tradeCount} trades</div>
+        </div>
+        <Badge variant="outline" className="h-5 shrink-0 rounded-md px-2 text-[11px]">
+          {settlement.errorCount} risk periods
+        </Badge>
+      </div>
+      <div className="mt-3 grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-2 text-xs">
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Total PnL</div>
+          <div className={cn("metric-tabular mt-1 break-words font-medium", colorForPnl(settlement.totalPnl))}>
+            {formatPln(settlement.totalPnl)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Imb. PnL</div>
+          <div className={cn("metric-tabular mt-1 break-words font-medium", colorForPnl(settlement.imbalancePnl))}>
+            {formatPln(settlement.imbalancePnl)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Abs imbalance</div>
+          <div className="metric-tabular mt-1 break-words font-medium">
+            {formatMwh(settlement.totalImbalanceAbsMwh)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Worst period</div>
+          <div className="metric-tabular mt-1 break-words font-medium">
+            {settlement.worstPeriod
+              ? `${settlement.worstPeriod.label} | ${formatPln(settlement.worstPeriod.periodPnl)}`
+              : "n/a"}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ReplayView() {
   const scenario = useSimulationStore((state) => state.scenario);
   const contracts = useSimulationStore((state) => state.contracts);
   const trades = useSimulationStore((state) => state.trades);
+  const decisionLog = useSimulationStore((state) => state.decisionLog);
   const currentPeriod = useSimulationStore((state) => state.currentPeriod);
+  const selectedPeriod = useSimulationStore((state) => state.selectedPeriod);
+  const botResult = useSimulationStore((state) => state.botResult);
   const setSelectedPeriod = useSimulationStore((state) => state.setSelectedPeriod);
-  const settlement = useMemo(
-    () => settlePortfolio(scenario.periods, contracts, trades),
-    [scenario.periods, contracts, trades]
+  const [activeFilter, setActiveFilter] = useState<ReplayTimelineKind | "all">("all");
+  const replayBotResult = useMemo(
+    () =>
+      botResult ??
+      runAutopilot(
+        scenario,
+        contracts,
+        undefined,
+        getScenarioSetupTrades(trades)
+      ),
+    [botResult, scenario, contracts, trades]
   );
-  const replayRows = settlement.periods.slice(0, Math.max(currentPeriod + 1, 16));
+  const replayInput = useMemo(
+    () => ({
+      scenario,
+      contracts,
+      manualTrades: trades,
+      scriptTrades: replayBotResult.trades,
+      decisionLog,
+      currentPeriod,
+    }),
+    [scenario, contracts, trades, replayBotResult.trades, decisionLog, currentPeriod]
+  );
+  const periodInsights = useMemo(
+    () => buildReplayPeriodInsights(replayInput),
+    [replayInput]
+  );
+  const timeline = useMemo(() => buildReplayTimeline(replayInput), [replayInput]);
+  const lessons = useMemo(() => buildScenarioLessons(replayInput), [replayInput]);
+  const filteredTimeline = useMemo(
+    () =>
+      activeFilter === "all"
+        ? timeline
+        : timeline.filter((event) => event.kind === activeFilter),
+    [activeFilter, timeline]
+  );
+  const activeInsight =
+    periodInsights.find((insight) => insight.periodIndex === selectedPeriod) ??
+    periodInsights.at(-1);
+  const visibleManualPnl = periodInsights.reduce((sum, insight) => sum + insight.manualPnl, 0);
+  const visibleScriptPnl = periodInsights.reduce(
+    (sum, insight) => sum + (insight.scriptPnl ?? insight.manualPnl),
+    0
+  );
+  const scriptGap = visibleScriptPnl - visibleManualPnl;
+  const avoidableCost = periodInsights.reduce(
+    (sum, insight) => sum + Math.max(insight.pnlGapToScript ?? 0, 0),
+    0
+  );
+  const worstInsight = [...periodInsights].sort(
+    (left, right) => left.manualPnl - right.manualPnl
+  )[0];
+  const replayRows = periodInsights.slice(0, Math.max(currentPeriod + 1, 16));
+  const filters: Array<ReplayTimelineKind | "all"> = [
+    "all",
+    "manual-decision",
+    "bot-edge",
+    "imbalance-leak",
+    "good-hedge",
+  ];
+
+  function inspectPeriod(periodIndex: number) {
+    setSelectedPeriod(periodIndex);
+  }
 
   return (
     <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
-      <Card className="rounded-lg border-border/70 bg-card/80">
-        <CardHeader>
-          <CardTitle>Results replay</CardTitle>
-          <CardDescription>Audit each settlement period and spot where PnL leaked</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <ScrollArea className="h-[620px]">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Period</TableHead>
-                  <TableHead>Contracted</TableHead>
-                  <TableHead>RDB net</TableHead>
-                  <TableHead>Imbalance</TableHead>
-                  <TableHead>Imbalance price</TableHead>
-                  <TableHead>Contract PnL</TableHead>
-                  <TableHead>Market PnL</TableHead>
-                  <TableHead>Total PnL</TableHead>
-                  <TableHead />
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {replayRows.map((row) => (
-                  <TableRow key={row.periodIndex}>
-                    <TableCell className="metric-tabular font-medium">{row.label}</TableCell>
-                    <TableCell className="metric-tabular">
-                      {formatMwh(row.contractedPosition)}
-                    </TableCell>
-                    <TableCell className="metric-tabular">{formatMwh(row.marketPosition)}</TableCell>
-                    <TableCell className="metric-tabular">{formatMwh(row.imbalanceMwh)}</TableCell>
-                    <TableCell className="metric-tabular">{formatPrice(row.imbalancePrice)}</TableCell>
-                    <TableCell className={cn("metric-tabular", colorForPnl(row.contractPnl))}>
-                      {formatPln(row.contractPnl)}
-                    </TableCell>
-                    <TableCell className={cn("metric-tabular", colorForPnl(row.marketPnl))}>
-                      {formatPln(row.marketPnl)}
-                    </TableCell>
-                    <TableCell className={cn("metric-tabular font-medium", colorForPnl(row.periodPnl))}>
-                      {formatPln(row.periodPnl)}
-                    </TableCell>
-                    <TableCell>
-                      <Button variant="ghost" size="sm" onClick={() => setSelectedPeriod(row.periodIndex)}>
-                        Inspect
-                      </Button>
-                    </TableCell>
-                  </TableRow>
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <MetricCard
+          title="Replay PnL"
+          value={formatPln(visibleManualPnl)}
+          description={`Visible through ${scenario.periods[currentPeriod]?.label ?? "day close"}`}
+          icon={ScrollTextIcon}
+          tone={pnlTone(visibleManualPnl)}
+        />
+        <MetricCard
+          title="Gap to script"
+          value={formatPln(scriptGap)}
+          description={scriptGap > 0 ? "Script found better execution" : "Manual is ahead"}
+          icon={BotIcon}
+          tone={scriptGap > 0 ? "warning" : pnlTone(-scriptGap)}
+        />
+        <MetricCard
+          title="Avoidable cost"
+          value={formatPln(avoidableCost)}
+          description={`${timeline.filter((event) => event.kind === "bot-edge").length} script edge periods`}
+          icon={AlertTriangleIcon}
+          tone={avoidableCost > 0 ? "negative" : "neutral"}
+        />
+        <MetricCard
+          title="Worst period"
+          value={worstInsight ? `${worstInsight.label} | ${formatPln(worstInsight.manualPnl)}` : "n/a"}
+          description={
+            worstInsight
+              ? `${formatMwh(worstInsight.manualImbalanceMwh)} manual imbalance`
+              : "No periods visible"
+          }
+          icon={GaugeIcon}
+          tone={worstInsight ? pnlTone(worstInsight.manualPnl) : "neutral"}
+        />
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(340px,0.9fr)]">
+        <Card className="rounded-lg border-border/70 bg-card/80">
+          <CardHeader>
+            <CardTitle>Replay timeline</CardTitle>
+            <CardDescription>Manual decisions, script edges and imbalance leaks</CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3">
+            <div className="flex flex-wrap gap-2">
+              {filters.map((filter) => (
+                <Button
+                  key={filter}
+                  size="sm"
+                  variant={activeFilter === filter ? "default" : "outline"}
+                  onClick={() => setActiveFilter(filter)}
+                >
+                  {replayKindLabel(filter)}
+                </Button>
+              ))}
+            </div>
+            {filteredTimeline.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
+                No events in this filter for the visible settlement window.
+              </div>
+            ) : (
+              <ScrollArea className="h-[380px] pr-3">
+                <div className="flex flex-col gap-2">
+                  {filteredTimeline.map((event) => {
+                    const Icon = replayEventIcon(event.kind);
+
+                    return (
+                      <button
+                        key={event.id}
+                        className={cn(
+                          "grid grid-cols-[auto_1fr_auto] items-start gap-3 rounded-lg border border-border/70 bg-muted/25 p-3 text-left transition hover:border-primary/60 hover:bg-muted/40",
+                          selectedPeriod === event.periodIndex && "border-primary/70 bg-primary/10"
+                        )}
+                        type="button"
+                        onClick={() => inspectPeriod(event.periodIndex)}
+                      >
+                        <span className="mt-0.5 flex size-8 items-center justify-center rounded-md border border-border/70 bg-background/70">
+                          <Icon data-icon="inline-start" />
+                        </span>
+                        <span className="min-w-0">
+                          <span className="flex flex-wrap items-center gap-2">
+                            <span className="metric-tabular text-xs text-muted-foreground">
+                              {event.label}
+                            </span>
+                            <Badge variant="outline">{replayKindLabel(event.kind)}</Badge>
+                          </span>
+                          <span className={cn("mt-1 block font-medium", replayToneClass(event.tone))}>
+                            {event.title}
+                          </span>
+                          <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                            {event.description}
+                          </span>
+                        </span>
+                        <span className={cn("metric-tabular text-sm font-medium", colorForPnl(event.pnlImpact))}>
+                          {formatPln(event.pnlImpact)}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </ScrollArea>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="rounded-lg border-border/70 bg-card/80">
+          <CardHeader>
+            <CardTitle>Period drilldown</CardTitle>
+            <CardDescription>
+              {activeInsight
+                ? `${activeInsight.label} settlement comparison`
+                : "Select a replay event"}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            {activeInsight ? (
+              <div className="flex flex-col gap-4">
+                <div className="grid gap-2 sm:grid-cols-3">
+                  <div className="rounded-md border border-border/70 bg-muted/25 p-3">
+                    <div className="text-xs text-muted-foreground">Manual</div>
+                    <div className={cn("metric-tabular mt-1 font-medium", colorForPnl(activeInsight.manualPnl))}>
+                      {formatPln(activeInsight.manualPnl)}
+                    </div>
+                    <div className="metric-tabular mt-1 text-xs text-muted-foreground">
+                      {formatMwh(activeInsight.manualImbalanceMwh)}
+                    </div>
+                  </div>
+                  <div className="rounded-md border border-border/70 bg-muted/25 p-3">
+                    <div className="text-xs text-muted-foreground">Script</div>
+                    <div className={cn("metric-tabular mt-1 font-medium", colorForPnl(activeInsight.scriptPnl ?? 0))}>
+                      {formatMaybePln(activeInsight.scriptPnl)}
+                    </div>
+                    <div className="metric-tabular mt-1 text-xs text-muted-foreground">
+                      {formatMaybeMwh(activeInsight.scriptImbalanceMwh)}
+                    </div>
+                  </div>
+                  <div className="rounded-md border border-border/70 bg-muted/25 p-3">
+                    <div className="text-xs text-muted-foreground">Baseline</div>
+                    <div className={cn("metric-tabular mt-1 font-medium", colorForPnl(activeInsight.baselinePnl))}>
+                      {formatPln(activeInsight.baselinePnl)}
+                    </div>
+                    <div className="metric-tabular mt-1 text-xs text-muted-foreground">
+                      {formatMwh(activeInsight.baselineImbalanceMwh)}
+                    </div>
+                  </div>
+                </div>
+                <div className="grid gap-2 text-sm">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">Gap to script</span>
+                    <span className={cn("metric-tabular font-medium", colorForPnl(activeInsight.pnlGapToScript ?? 0))}>
+                      {formatMaybePln(activeInsight.pnlGapToScript)}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">Manual vs baseline</span>
+                    <span className={cn("metric-tabular font-medium", colorForPnl(activeInsight.pnlGapToBaseline))}>
+                      {formatPln(activeInsight.pnlGapToBaseline)}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">RDB trades</span>
+                    <span className="metric-tabular">
+                      {activeInsight.manualTradeCount} manual / {activeInsight.scriptTradeCount} script
+                    </span>
+                  </div>
+                </div>
+                <Alert>
+                  <InfoIcon data-icon="inline-start" />
+                  <AlertTitle>Replay note</AlertTitle>
+                  <AlertDescription>{activeInsight.recommendation}</AlertDescription>
+                </Alert>
+              </div>
+            ) : (
+              <div className="rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
+                No settlement periods are visible yet.
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]">
+        <Card className="rounded-lg border-border/70 bg-card/80">
+          <CardHeader>
+            <CardTitle>Lesson learned</CardTitle>
+            <CardDescription>Highest-value takeaways from this scenario</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {lessons.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
+                No lessons generated for the visible settlement window.
+              </div>
+            ) : (
+              <div className="grid gap-2">
+                {lessons.map((lesson) => (
+                  <div
+                    key={lesson.id}
+                    className="rounded-lg border border-border/70 bg-muted/25 p-3 text-sm"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className={cn("font-medium", replayToneClass(lesson.tone))}>
+                          {lesson.title}
+                        </div>
+                        <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                          {lesson.label}: {lesson.reason}
+                        </div>
+                      </div>
+                      <div className={cn("metric-tabular shrink-0 font-medium", colorForPnl(lesson.pnlImpact))}>
+                        {formatPln(lesson.pnlImpact)}
+                      </div>
+                    </div>
+                    <div className="mt-2 border-t border-border/70 pt-2 text-xs text-muted-foreground">
+                      {lesson.recommendation}
+                    </div>
+                  </div>
                 ))}
-              </TableBody>
-            </Table>
-          </ScrollArea>
-        </CardContent>
-      </Card>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="rounded-lg border-border/70 bg-card/80">
+          <CardHeader>
+            <CardTitle>Settlement audit</CardTitle>
+            <CardDescription>Manual, script and no-action baseline by 15-minute period</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ScrollArea className="h-[420px] md:hidden">
+              <div className="flex flex-col gap-3 pr-3">
+                {replayRows.map((row: ReplayPeriodInsight) => (
+                  <MobileReplayAuditCard
+                    key={row.periodIndex}
+                    row={row}
+                    onInspect={inspectPeriod}
+                  />
+                ))}
+              </div>
+            </ScrollArea>
+            <div className="hidden overflow-x-auto md:block">
+              <ScrollArea className="h-[420px]">
+                <Table className="min-w-[660px]">
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-[72px]">Period</TableHead>
+                      <TableHead>Manual PnL</TableHead>
+                      <TableHead>Script PnL</TableHead>
+                      <TableHead>Baseline</TableHead>
+                      <TableHead>Manual MWh</TableHead>
+                      <TableHead>Script MWh</TableHead>
+                      <TableHead className="w-[64px]" />
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {replayRows.map((row: ReplayPeriodInsight) => (
+                      <TableRow key={row.periodIndex}>
+                        <TableCell className="metric-tabular font-medium">{row.label}</TableCell>
+                        <TableCell className={cn("metric-tabular", colorForPnl(row.manualPnl))}>
+                          {formatPln(row.manualPnl)}
+                        </TableCell>
+                        <TableCell
+                          className={cn("metric-tabular", colorForPnl(row.scriptPnl ?? 0))}
+                        >
+                          {formatMaybePln(row.scriptPnl)}
+                        </TableCell>
+                        <TableCell className={cn("metric-tabular", colorForPnl(row.baselinePnl))}>
+                          {formatPln(row.baselinePnl)}
+                        </TableCell>
+                        <TableCell className="metric-tabular">
+                          {formatMwh(row.manualImbalanceMwh)}
+                        </TableCell>
+                        <TableCell className="metric-tabular">
+                          {formatMaybeMwh(row.scriptImbalanceMwh)}
+                        </TableCell>
+                        <TableCell>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => inspectPeriod(row.periodIndex)}
+                          >
+                            View
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </ScrollArea>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function MobileReplayAuditCard({
+  row,
+  onInspect,
+}: {
+  row: ReplayPeriodInsight;
+  onInspect: (periodIndex: number) => void;
+}) {
+  return (
+    <div
+      className="min-w-0 rounded-md border border-[#263f49] bg-[#0a1418] p-3"
+      data-testid="mobile-replay-audit-card"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="text-xs text-muted-foreground">Period</div>
+          <div className="metric-tabular mt-1 text-sm font-semibold">{row.label}</div>
+        </div>
+        <Button size="sm" variant="secondary" onClick={() => onInspect(row.periodIndex)}>
+          View
+        </Button>
+      </div>
+      <div className="mt-3 grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-2 text-xs">
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Manual PnL</div>
+          <div className={cn("metric-tabular mt-1 break-words font-medium", colorForPnl(row.manualPnl))}>
+            {formatPln(row.manualPnl)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Script PnL</div>
+          <div className={cn("metric-tabular mt-1 break-words font-medium", colorForPnl(row.scriptPnl ?? 0))}>
+            {formatMaybePln(row.scriptPnl)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Baseline</div>
+          <div className={cn("metric-tabular mt-1 break-words font-medium", colorForPnl(row.baselinePnl))}>
+            {formatPln(row.baselinePnl)}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Manual MWh</div>
+          <div className="metric-tabular mt-1 break-words font-medium">
+            {formatMwh(row.manualImbalanceMwh)}
+          </div>
+        </div>
+        <div className="col-span-2 min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
+          <div className="text-muted-foreground">Script MWh</div>
+          <div className="metric-tabular mt-1 break-words font-medium">
+            {formatMaybeMwh(row.scriptImbalanceMwh)}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

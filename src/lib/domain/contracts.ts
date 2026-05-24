@@ -105,16 +105,26 @@ export const CONTRACT_TEMPLATES: ContractTemplate[] = [
   },
 ];
 
-export function createDefaultContracts(): Contract[] {
-  return ["ppa-pv-pay-as-produced", "industrial-retail-load", "base-forward-buy"].map(
-    (templateId, index) => createContractFromTemplate(templateId, `seed-${index + 1}`)
+export const DEFAULT_CONTRACT_TEMPLATE_IDS = [
+  "ppa-pv-pay-as-produced",
+  "industrial-retail-load",
+  "base-forward-buy",
+] as const;
+
+export function createDefaultContracts(
+  templateIds: readonly string[] = DEFAULT_CONTRACT_TEMPLATE_IDS
+): Contract[] {
+  return templateIds.map((templateId, index) =>
+    createContractFromTemplate(templateId, `seed-${index + 1}`)
   );
 }
 
 export function createContractFromTemplate(templateId: string, suffix: string): Contract {
-  const template =
-    CONTRACT_TEMPLATES.find((candidate) => candidate.templateId === templateId) ??
-    CONTRACT_TEMPLATES[0];
+  const template = CONTRACT_TEMPLATES.find((candidate) => candidate.templateId === templateId);
+
+  if (!template) {
+    throw new Error(`Unknown contract template id: ${templateId}`);
+  }
 
   return {
     ...template,

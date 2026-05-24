@@ -10,24 +10,33 @@ import {
 } from "../domain/decisions";
 import { buildDayAheadAuctionTrades, getScenarioSetupTrades } from "../domain/markets";
 import { getTradablePeriods } from "../domain/metrics";
-import { createScenario } from "../domain/scenarios";
+import { getPortfolioDefinition, parsePortfolioId } from "../domain/portfolios";
+import { createDefaultScenarioConfig, createScenario } from "../domain/scenarios";
 import { runAutopilot, type StrategyRunResult } from "../domain/strategy";
-import type {
-  Contract,
-  GameMode,
-  MarketTrade,
-  OrderDraft,
-  Scenario,
-  ScenarioId,
-  SimulationClockState,
+import {
+  scenarioConfigSchema,
+  type Contract,
+  type GameMode,
+  type MarketTrade,
+  type OrderDraft,
+  type PortfolioDefinition,
+  type PortfolioId,
+  type Scenario,
+  type ScenarioConfig,
+  type ScenarioId,
+  type SimulationClockState,
 } from "../domain/types";
 
 export type AppView = "dashboard" | "contracts" | "market" | "forecast" | "duel" | "replay";
 
 interface SimulationStore {
   activeView: AppView;
+  portfolioId: PortfolioId;
+  portfolio: PortfolioDefinition;
   scenarioId: ScenarioId;
   scenario: Scenario;
+  scenarioConfig: ScenarioConfig;
+  scenarioConfigDraft: ScenarioConfig;
   mode: GameMode;
   currentPeriod: number;
   isRunning: boolean;
@@ -41,9 +50,13 @@ interface SimulationStore {
   statusMessage: string;
   botResult?: StrategyRunResult;
   setView: (view: AppView) => void;
+  setPortfolio: (portfolioId: string) => void;
   setScenario: (scenarioId: ScenarioId) => void;
   setMode: (mode: GameMode) => void;
   setSelectedPeriod: (periodIndex: number) => void;
+  updateScenarioConfigDraft: (draft: Partial<ScenarioConfig>) => void;
+  applyScenarioConfig: () => void;
+  resetScenarioConfig: () => void;
   updateOrderDraft: (draft: Partial<OrderDraft>) => void;
   play: () => void;
   pause: () => void;
@@ -80,16 +93,26 @@ function buildInitialClock(): SimulationClockState {
   };
 }
 
-function buildInitialState(scenarioId: ScenarioId = "sunny-negative") {
-  const scenario = createScenario(scenarioId);
+function buildInitialState(
+  scenarioId: ScenarioId = "sunny-negative",
+  scenarioConfig?: ScenarioConfig,
+  portfolioId: PortfolioId = "alpha-power"
+) {
+  const scenario = createScenario(scenarioId, scenarioConfig);
+  const portfolio = getPortfolioDefinition(portfolioId);
+  const resolvedScenarioConfig = scenario.metadata.config;
   const clock = buildInitialClock();
   const tradablePeriod = getTradablePeriods(scenario, clock.currentPeriod)[0] ?? scenario.periods.at(-1);
   const selectedPeriod = tradablePeriod?.index ?? clock.currentPeriod;
-  const contracts = createDefaultContracts();
+  const contracts = createDefaultContracts(portfolio.defaultContractTemplateIds);
 
   return {
+    portfolioId: portfolio.id,
+    portfolio,
     scenarioId,
     scenario,
+    scenarioConfig: resolvedScenarioConfig,
+    scenarioConfigDraft: resolvedScenarioConfig,
     mode: "manual" as GameMode,
     ...clock,
     selectedPeriod,
@@ -105,14 +128,53 @@ function buildInitialState(scenarioId: ScenarioId = "sunny-negative") {
 export const useSimulationStore = create<SimulationStore>((set, get) => ({
   activeView: "dashboard",
   ...buildInitialState(),
-  setView: (view) => set({ activeView: view }),
-  setScenario: (scenarioId) =>
+  setView: (view) =>
+    set((state) => ({
+      activeView: view,
+      mode: view === "replay" ? "replay" : state.mode === "replay" ? "manual" : state.mode,
+    })),
+  setPortfolio: (portfolioId) => {
+    const state = get();
+    const parsedPortfolioId = parsePortfolioId(portfolioId);
+
+    if (!parsedPortfolioId) {
+      set({ statusMessage: `Unknown portfolio id: ${portfolioId}. Portfolio was not changed.` });
+      return;
+    }
+
+    const activeView = state.activeView;
+    const initialState = buildInitialState(
+      state.scenarioId,
+      state.scenarioConfig,
+      parsedPortfolioId
+    );
+
     set({
-      ...buildInitialState(scenarioId),
-      activeView: get().activeView,
-      statusMessage: `Scenario switched to ${createScenario(scenarioId).definition.name}.`,
-    }),
-  setMode: (mode) => set({ mode }),
+      ...initialState,
+      scenarioConfigDraft: state.scenarioConfigDraft,
+      activeView,
+      mode: activeView === "replay" ? "replay" : "manual",
+      statusMessage: `Portfolio switched to ${initialState.portfolio.name}. RDN setup and contracts were rebuilt.`,
+    });
+  },
+  setScenario: (scenarioId) => {
+    const state = get();
+    const activeView = state.activeView;
+    const initialState = buildInitialState(scenarioId, undefined, state.portfolioId);
+
+    set({
+      ...initialState,
+      activeView,
+      mode: activeView === "replay" ? "replay" : "manual",
+      statusMessage: `Scenario switched to ${initialState.scenario.definition.name}.`,
+    });
+  },
+  setMode: (mode) =>
+    set((state) => ({
+      mode,
+      activeView:
+        mode === "replay" ? "replay" : state.activeView === "replay" ? "dashboard" : state.activeView,
+    })),
   setSelectedPeriod: (periodIndex) =>
     set((state) => ({
       selectedPeriod: periodIndex,
@@ -125,6 +187,53 @@ export const useSimulationStore = create<SimulationStore>((set, get) => ({
             : (state.scenario.periods[periodIndex]?.intradayBid ?? state.orderDraft.limitPrice) - 8,
       },
     })),
+  updateScenarioConfigDraft: (draft) =>
+    set((state) => {
+      const parsed = scenarioConfigSchema.safeParse({
+        ...state.scenarioConfigDraft,
+        ...draft,
+      });
+
+      if (!parsed.success) {
+        return {
+          statusMessage: "Scenario editor value is outside the supported calibration range.",
+        };
+      }
+
+      return {
+        scenarioConfigDraft: parsed.data,
+        statusMessage: "Scenario editor draft updated. Apply to rebuild the trading day.",
+      };
+    }),
+  applyScenarioConfig: () => {
+    const state = get();
+    const activeView = state.activeView;
+    const initialState = buildInitialState(
+      state.scenarioId,
+      state.scenarioConfigDraft,
+      state.portfolioId
+    );
+
+    set({
+      ...initialState,
+      activeView,
+      mode: activeView === "replay" ? "replay" : "manual",
+      statusMessage: `Scenario reset with seed ${initialState.scenario.metadata.seed}. Calibration preview is now live.`,
+    });
+  },
+  resetScenarioConfig: () => {
+    const state = get();
+    const activeView = state.activeView;
+    const defaultConfig = createDefaultScenarioConfig(state.scenarioId);
+    const initialState = buildInitialState(state.scenarioId, defaultConfig, state.portfolioId);
+
+    set({
+      ...initialState,
+      activeView,
+      mode: activeView === "replay" ? "replay" : "manual",
+      statusMessage: `Scenario config reset to ${initialState.scenario.definition.shortName} defaults.`,
+    });
+  },
   updateOrderDraft: (draft) =>
     set((state) => ({
       orderDraft: {
@@ -201,9 +310,9 @@ export const useSimulationStore = create<SimulationStore>((set, get) => ({
         1
       )} MWh for ${period.label} matched at ${preview.trade.pricePlnMwh.toFixed(
         0
-      )} PLN/MWh. ${decisionLogEntry.title}: ${preview.pnlImpact.toFixed(
+      )} ${state.scenario.metadata.currency}/MWh. ${decisionLogEntry.title}: ${preview.pnlImpact.toFixed(
         0
-      )} PLN, risk cut ${Math.max(preview.imbalanceReductionMwh, 0).toFixed(1)} MWh.`,
+      )} ${state.scenario.metadata.currency}, risk cut ${Math.max(preview.imbalanceReductionMwh, 0).toFixed(1)} MWh.`,
       botResult: undefined,
     });
   },
@@ -254,6 +363,8 @@ export const useSimulationStore = create<SimulationStore>((set, get) => ({
         currentPeriod: nextPeriod,
         isClosed,
         isRunning: isClosed ? false : state.isRunning,
+        activeView: isClosed ? "replay" : state.activeView,
+        mode: isClosed ? "replay" : state.mode,
         selectedPeriod:
           state.selectedPeriod > nextPeriod ? state.selectedPeriod : nextTradablePeriod.index,
         orderDraft: {
@@ -276,13 +387,41 @@ export const useSimulationStore = create<SimulationStore>((set, get) => ({
       currentPeriod: state.scenario.periods.length - 1,
       isRunning: false,
       isClosed: true,
+      activeView: "replay",
+      mode: "replay",
       selectedPeriod: state.scenario.periods.length - 1,
       statusMessage: "Trading day closed. Final imbalance settlement is available.",
     })),
   resetScenario: () =>
-    set((state) => ({ ...buildInitialState(state.scenarioId), activeView: state.activeView })),
+    set((state) => {
+      const initialState = buildInitialState(
+        state.scenarioId,
+        state.scenarioConfig,
+        state.portfolioId
+      );
+
+      return {
+        ...initialState,
+        scenarioConfigDraft: state.scenarioConfigDraft,
+        activeView: state.activeView,
+        mode: state.activeView === "replay" ? "replay" : "manual",
+      };
+    }),
   reset: () =>
-    set((state) => ({ ...buildInitialState(state.scenarioId), activeView: state.activeView })),
+    set((state) => {
+      const initialState = buildInitialState(
+        state.scenarioId,
+        state.scenarioConfig,
+        state.portfolioId
+      );
+
+      return {
+        ...initialState,
+        scenarioConfigDraft: state.scenarioConfigDraft,
+        activeView: state.activeView,
+        mode: state.activeView === "replay" ? "replay" : "manual",
+      };
+    }),
   runBotComparison: () => {
     const state = get();
     const botResult = runAutopilot(
