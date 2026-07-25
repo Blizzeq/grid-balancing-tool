@@ -219,6 +219,25 @@ const scenarioRangeControls: Array<{
   },
 ];
 
+/**
+ * Shared Recharts tooltip styling.
+ *
+ * Recharts defaults its label and item text to black. Every chart here set a
+ * dark background and a border but never a colour, so the tooltip text was
+ * black on a near-black panel. Defining it once also means the next chart
+ * cannot forget it.
+ */
+const CHART_TOOLTIP = {
+  contentStyle: {
+    background: "var(--popover)",
+    border: "1px solid var(--border)",
+    borderRadius: 6,
+    color: "var(--popover-foreground)",
+  },
+  labelStyle: { color: "var(--popover-foreground)", fontWeight: 600 },
+  itemStyle: { color: "var(--popover-foreground)" },
+} as const;
+
 function configsEqual(left: ScenarioConfig, right: ScenarioConfig): boolean {
   return scenarioConfigKeys.every((key) => left[key] === right[key]);
 }
@@ -1880,11 +1899,7 @@ function DashboardView() {
                   />
                   <YAxis domain={[-150, 150]} tickLine={false} axisLine={false} width={42} />
                   <Tooltip
-                    contentStyle={{
-                      background: "var(--popover)",
-                      border: "1px solid var(--border)",
-                      borderRadius: 6,
-                    }}
+                    {...CHART_TOOLTIP}
                   />
                   <ReferenceLine y={metrics.maxPositionLimitMwh} stroke="var(--energy-positive)" strokeDasharray="4 4" />
                   <ReferenceLine y={-metrics.maxPositionLimitMwh} stroke="var(--energy-negative)" strokeDasharray="4 4" />
@@ -1960,11 +1975,7 @@ function DashboardView() {
                   />
                   <Tooltip
                     formatter={(value) => formatPln(Number(value))}
-                    contentStyle={{
-                      background: "var(--popover)",
-                      border: "1px solid var(--border)",
-                      borderRadius: 6,
-                    }}
+                    {...CHART_TOOLTIP}
                   />
                   <ReferenceLine y={0} stroke="#6f8188" />
                   <Bar dataKey="value" radius={[2, 2, 0, 0]}>
@@ -2063,11 +2074,7 @@ function DashboardView() {
                     width={42}
                   />
                   <Tooltip
-                    contentStyle={{
-                      background: "var(--popover)",
-                      border: "1px solid var(--border)",
-                      borderRadius: 6,
-                    }}
+                    {...CHART_TOOLTIP}
                   />
                   <ReferenceLine x={scenario.periods[currentPeriod]?.label} stroke="#e5e7eb" strokeDasharray="5 4" />
                   <Line dataKey="forecastLoad" stroke="var(--energy-cyan)" strokeDasharray="5 5" dot={false} type="monotone" />
@@ -2286,11 +2293,7 @@ function DashboardView() {
                 />
                 <Tooltip
                   formatter={(value) => formatPln(Number(value))}
-                  contentStyle={{
-                    background: "var(--popover)",
-                    border: "1px solid var(--border)",
-                    borderRadius: 6,
-                  }}
+                  {...CHART_TOOLTIP}
                 />
                 <Line dataKey="human" name="Human PnL" dot={false} stroke="var(--energy-cyan)" strokeWidth={2} type="monotone" />
                 <Line dataKey="algorithm" name="Algorithm PnL" dot={false} stroke="var(--energy-positive)" strokeWidth={2} type="monotone" />
@@ -3432,11 +3435,7 @@ function ForecastView() {
                   <XAxis dataKey="label" tickLine={false} axisLine={false} minTickGap={24} />
                   <YAxis tickLine={false} axisLine={false} width={42} />
                   <Tooltip
-                    contentStyle={{
-                      background: "var(--popover)",
-                      border: "1px solid var(--border)",
-                      borderRadius: 8,
-                    }}
+                    {...CHART_TOOLTIP}
                   />
                   <Line
                     dataKey="forecastGeneration"
@@ -3488,11 +3487,7 @@ function ForecastView() {
                   <XAxis dataKey="label" tickLine={false} axisLine={false} minTickGap={24} />
                   <YAxis tickLine={false} axisLine={false} width={42} />
                   <Tooltip
-                    contentStyle={{
-                      background: "var(--popover)",
-                      border: "1px solid var(--border)",
-                      borderRadius: 8,
-                    }}
+                    {...CHART_TOOLTIP}
                   />
                   <Area
                     dataKey="irradiance"
