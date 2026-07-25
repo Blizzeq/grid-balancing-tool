@@ -8,6 +8,7 @@ import {
   ChartCandlestickIcon,
   ChevronDownIcon,
   ChevronsLeftIcon,
+  ChevronsRightIcon,
   Clock3Icon,
   CloudSunIcon,
   FileSignatureIcon,
@@ -18,7 +19,6 @@ import {
   PlayIcon,
   RotateCcwIcon,
   ScrollTextIcon,
-  SettingsIcon,
   ShieldCheckIcon,
   SparklesIcon,
   StepForwardIcon,
@@ -57,6 +57,13 @@ import {
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import {
   Table,
   TableBody,
@@ -735,12 +742,8 @@ function TopStatusBar() {
             Reset
           </Button>
           <div className="flex items-center gap-1">
-            <Button variant="ghost" size="icon-sm" aria-label="Help">
-              <HelpCircleIcon data-icon="inline-start" />
-            </Button>
-            <Button variant="ghost" size="icon-sm" aria-label="Settings">
-              <SettingsIcon data-icon="inline-start" />
-            </Button>
+            <AlertsButton />
+            <HelpButton />
           </div>
         </div>
       </div>
@@ -885,18 +888,147 @@ function TopStatusBar() {
           </select>
         </div>
         <div className="ml-auto flex items-center gap-2">
-          <Button variant="ghost" size="icon-sm" aria-label="Notifications">
-            <BellIcon data-icon="inline-start" />
-          </Button>
-          <Button variant="ghost" size="icon-sm" aria-label="Help">
-            <HelpCircleIcon data-icon="inline-start" />
-          </Button>
-          <Button variant="ghost" size="icon-sm" aria-label="Settings">
-            <SettingsIcon data-icon="inline-start" />
-          </Button>
+          <AlertsButton />
+          <HelpButton />
         </div>
       </div>
     </header>
+  );
+}
+
+/** Live risk alerts, rebuilt from the same metrics the dashboard card uses. */
+function useRiskAlerts() {
+  const scenario = useSimulationStore((state) => state.scenario);
+  const contracts = useSimulationStore((state) => state.contracts);
+  const trades = useSimulationStore((state) => state.trades);
+  const currentPeriod = useSimulationStore((state) => state.currentPeriod);
+
+  return useMemo(
+    () => buildDashboardMetrics(scenario, contracts, trades, currentPeriod).riskAlerts,
+    [scenario, contracts, trades, currentPeriod]
+  );
+}
+
+const HELP_SECTIONS: Array<{ title: string; body: string }> = [
+  {
+    title: "What this is",
+    body: "A deterministic training simulator for a 15-minute Polish power trading day. Every run is reproducible from the scenario seed. It is not connected to any market API, exchange, or company system, and no money moves.",
+  },
+  {
+    title: "The trading day",
+    body: "You start with a physical contract book and the D-1 day-ahead (RDN) setup already locked in — you cannot change it. From there the day runs in 15-minute periods and you trade the intraday market (RDB/SIDC) to close the gap between what you contracted and what your portfolio actually does.",
+  },
+  {
+    title: "How you are scored",
+    body: "Anything you fail to balance settles as imbalance at the imbalance price, which is deliberately worse than the market price in both directions. Being long into a negative-price hour costs you, and so does being short into a peak. Your result is the settled cash position at the end of the day.",
+  },
+  {
+    title: "Execution is not free",
+    body: "Intraday liquidity is finite. Orders walk the depth levels, so a large order fills at a worse average price than the top of book. Spread, fees and slippage all apply, and an order larger than the available depth fills partially.",
+  },
+  {
+    title: "Modes",
+    body: "Simulation is manual trading. Assisted adds suggestions but leaves the decisions to you. Autopilot runs a scripted strategy that never sees future actuals, so it is a fair benchmark rather than a perfect one. Replay steps back through a finished day.",
+  },
+  {
+    title: "Controls",
+    body: "Step advances one 15-minute period. Play runs the clock at the selected speed. Run to end settles the whole remaining day at once. Reset rebuilds the scenario from its seed — same seed, same day, every time.",
+  },
+];
+
+function HelpSheet() {
+  const isOpen = useSimulationStore((state) => state.isHelpOpen);
+  const setHelpOpen = useSimulationStore((state) => state.setHelpOpen);
+
+  return (
+    <Sheet open={isOpen} onOpenChange={setHelpOpen}>
+      <SheetContent className="w-full sm:max-w-md" side="right">
+        <SheetHeader>
+          <SheetTitle>How the simulator works</SheetTitle>
+          <SheetDescription>
+            Balancing a power portfolio across a 15-minute trading day.
+          </SheetDescription>
+        </SheetHeader>
+        <ScrollArea className="h-[calc(100vh-8rem)] px-4">
+          <div className="flex flex-col gap-5 pb-8">
+            {HELP_SECTIONS.map((section) => (
+              <section key={section.title}>
+                <h3 className="text-sm font-semibold text-foreground">{section.title}</h3>
+                <p className="mt-1 text-[13px] leading-relaxed text-muted-foreground">
+                  {section.body}
+                </p>
+              </section>
+            ))}
+          </div>
+        </ScrollArea>
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+function AlertsSheet() {
+  const isOpen = useSimulationStore((state) => state.isAlertsOpen);
+  const setAlertsOpen = useSimulationStore((state) => state.setAlertsOpen);
+  const alerts = useRiskAlerts();
+
+  return (
+    <Sheet open={isOpen} onOpenChange={setAlertsOpen}>
+      <SheetContent className="w-full sm:max-w-md" side="right">
+        <SheetHeader>
+          <SheetTitle>Risk &amp; alerts</SheetTitle>
+          <SheetDescription>
+            {alerts.length === 0
+              ? "Nothing flagged for the current period."
+              : `${alerts.length} active for the current period.`}
+          </SheetDescription>
+        </SheetHeader>
+        <ScrollArea className="h-[calc(100vh-8rem)] px-4">
+          <div className="flex flex-col gap-2 pb-8">
+            {alerts.map((alert) => (
+              <RiskAlertRow alert={alert} key={alert.id} />
+            ))}
+          </div>
+        </ScrollArea>
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+/** The bell, with a live count of what is currently flagged. */
+function AlertsButton() {
+  const setAlertsOpen = useSimulationStore((state) => state.setAlertsOpen);
+  const alerts = useRiskAlerts();
+
+  return (
+    <Button
+      variant="ghost"
+      size="icon-sm"
+      aria-label={`Notifications, ${alerts.length} active`}
+      className="relative"
+      onClick={() => setAlertsOpen(true)}
+    >
+      <BellIcon data-icon="inline-start" />
+      {alerts.length > 0 ? (
+        <span className="absolute -right-0.5 -top-0.5 flex size-4 items-center justify-center rounded-full bg-primary text-[9px] font-semibold text-primary-foreground">
+          {alerts.length}
+        </span>
+      ) : null}
+    </Button>
+  );
+}
+
+function HelpButton() {
+  const setHelpOpen = useSimulationStore((state) => state.setHelpOpen);
+
+  return (
+    <Button
+      variant="ghost"
+      size="icon-sm"
+      aria-label="Help"
+      onClick={() => setHelpOpen(true)}
+    >
+      <HelpCircleIcon data-icon="inline-start" />
+    </Button>
   );
 }
 
@@ -911,17 +1043,26 @@ function TradingShell({ children }: { children: React.ReactNode }) {
   const speed = useSimulationStore((state) => state.speed);
   const statusMessage = useSimulationStore((state) => state.statusMessage);
   const isClosed = useSimulationStore((state) => state.isClosed);
+  const isSidebarCollapsed = useSimulationStore((state) => state.isSidebarCollapsed);
+  const toggleSidebar = useSimulationStore((state) => state.toggleSidebar);
 
   return (
     <div className="min-h-screen bg-[#071115] text-foreground xl:h-screen xl:overflow-hidden">
       <div className="flex min-h-screen flex-col lg:flex-row xl:h-screen">
-        <aside className="flex border-b border-[#243b44] bg-[#081116]/98 lg:min-h-screen lg:w-[204px] lg:flex-col lg:border-r lg:border-b-0">
+        <aside
+          className={cn(
+            "flex border-b border-[#243b44] bg-[#081116]/98 transition-[width] duration-200 lg:min-h-screen lg:flex-col lg:border-r lg:border-b-0",
+            // Collapsing only applies from lg up; below that the sidebar is a
+            // horizontal bar and there is no width to reclaim.
+            isSidebarCollapsed ? "lg:w-[68px]" : "lg:w-[204px]"
+          )}
+        >
           <div className="flex items-center justify-between gap-3 px-4 py-4 lg:flex-col lg:items-start lg:gap-5 lg:px-5">
             <div className="flex items-center gap-3">
               <div className="flex size-10 items-center justify-center text-primary">
                 <ZapIcon data-icon="inline-start" />
               </div>
-              <div className="flex flex-col">
+              <div className={cn("flex flex-col", isSidebarCollapsed && "lg:hidden")}>
                 <span className="text-base font-semibold leading-5">GridBalance</span>
                 <span className="text-xs text-muted-foreground">Balancing Simulator</span>
               </div>
@@ -931,25 +1072,39 @@ function TradingShell({ children }: { children: React.ReactNode }) {
             {NAV_ITEMS.map((item) => {
               const Icon = item.icon;
               const selected = item.view === activeView;
+              // The replay entry renders shorter than its configured label, and
+              // an aria-label overrides visible text as the accessible name —
+              // so both have to come from the same string, or the button stops
+              // being findable by what it actually says.
+              const navLabel = item.view === "replay" ? "Replay" : item.label;
 
               return (
                 <Button
                   key={item.view}
                   variant="ghost"
+                  aria-label={navLabel}
+                  title={isSidebarCollapsed ? navLabel : undefined}
                   className={cn(
                     "h-10 justify-start rounded-md border border-transparent px-3 text-sidebar-foreground",
                     selected &&
-                      "border-[#273f48] bg-[#15232a] shadow-[inset_3px_0_0_var(--primary)]"
+                      "border-[#273f48] bg-[#15232a] shadow-[inset_3px_0_0_var(--primary)]",
+                    isSidebarCollapsed && "lg:justify-center lg:px-0"
                   )}
                   onClick={() => setView(item.view)}
                 >
                   <Icon data-icon="inline-start" />
-                  {item.view === "replay" ? "Replay" : item.label}
+                  <span className={cn(isSidebarCollapsed && "lg:hidden")}>{navLabel}</span>
                 </Button>
               );
             })}
           </nav>
           <div className="mt-auto hidden flex-col gap-2 p-3 lg:flex">
+            <div
+              className={cn(
+                "flex flex-col gap-2",
+                isSidebarCollapsed && "lg:hidden"
+              )}
+            >
             <div className="rounded-md border border-[#263f49] bg-[#0d1a20] p-3">
               <label className="text-xs text-muted-foreground" htmlFor="sidebar-portfolio">
                 Portfolio
@@ -983,9 +1138,23 @@ function TradingShell({ children }: { children: React.ReactNode }) {
                 {portfolio.balancingParty}
               </div>
             </div>
-            <Button variant="outline" className="h-12 justify-between rounded-md">
-              Collapse
-              <ChevronsLeftIcon data-icon="inline-end" />
+            </div>
+            <Button
+              variant="outline"
+              aria-label={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+              aria-expanded={!isSidebarCollapsed}
+              className={cn(
+                "h-12 rounded-md",
+                isSidebarCollapsed ? "justify-center px-0" : "justify-between"
+              )}
+              onClick={toggleSidebar}
+            >
+              <span className={cn(isSidebarCollapsed && "hidden")}>Collapse</span>
+              {isSidebarCollapsed ? (
+                <ChevronsRightIcon data-icon="inline-start" />
+              ) : (
+                <ChevronsLeftIcon data-icon="inline-end" />
+              )}
             </Button>
           </div>
         </aside>
@@ -1924,7 +2093,6 @@ function DashboardView() {
           </DashboardCard>
           <DashboardCard
             title="Signed Contracts"
-            action={<Button variant="outline" size="sm" className="h-6 rounded-md text-xs">View all</Button>}
             className="xl:h-[280px]"
           >
             <div className="flex flex-col gap-3 md:hidden">
@@ -2039,7 +2207,6 @@ function DashboardView() {
           <OrderTicket />
           <DashboardCard
             title="Risk & Alerts (Real-time)"
-            action={<Button variant="outline" size="sm" className="h-6 rounded-md text-xs">View all</Button>}
             className="xl:h-[192px]"
           >
             <div className="flex flex-col gap-1.5">
@@ -4229,6 +4396,8 @@ export function GridBalancingApp() {
   return (
     <TradingShell>
       <SimulationTicker />
+      <HelpSheet />
+      <AlertsSheet />
       <motion.div
         className="flex min-h-0 flex-1 flex-col"
         initial={{ opacity: 0, y: 8 }}

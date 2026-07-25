@@ -55,7 +55,31 @@ async function expectReadableHeading(text) {
   }
 }
 
+/**
+ * Every control in the shell has to actually do something.
+ *
+ * The header previously carried Help, Settings and Notifications buttons with
+ * no handler attached, plus two "View all" buttons on cards that already
+ * rendered their full list. They looked interactive and did nothing, which is
+ * worse than not having them. This asserts the survivors open what they claim.
+ */
+async function expectPanelOpens(buttonName, headingText) {
+  await page.getByRole("button", { name: buttonName }).first().click();
+  await page.getByRole("heading", { name: headingText }).waitFor({ timeout: 5000 });
+  await page.keyboard.press("Escape");
+  await page.getByRole("heading", { name: headingText }).waitFor({ state: "hidden", timeout: 5000 });
+}
+
 await page.goto(url, { waitUntil: "networkidle" });
+await expectPanelOpens(/^Help$/, "How the simulator works");
+await expectPanelOpens(/^Notifications/, "Risk & alerts");
+
+for (const orphan of ["Settings", "View all"]) {
+  if ((await page.getByRole("button", { name: orphan, exact: true }).count()) > 0) {
+    messages.push(`"${orphan}" button is back and does nothing`);
+  }
+}
+
 await expectReadableHeading("Forecast vs Actual (Generation/Load)");
 await expectReadableHeading("Signed Contracts");
 await page.locator("#sidebar-portfolio").selectOption("industrial-supply");

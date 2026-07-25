@@ -31,6 +31,13 @@ export type AppView = "dashboard" | "contracts" | "market" | "forecast" | "duel"
 
 interface SimulationStore {
   activeView: AppView;
+  // Shell UI state. It lives here rather than in component state because the
+  // header controls that toggle it are rendered twice — once for the desktop
+  // status bar and once for the mobile header — and both have to drive the
+  // same panel.
+  isHelpOpen: boolean;
+  isAlertsOpen: boolean;
+  isSidebarCollapsed: boolean;
   portfolioId: PortfolioId;
   portfolio: PortfolioDefinition;
   scenarioId: ScenarioId;
@@ -50,6 +57,9 @@ interface SimulationStore {
   statusMessage: string;
   botResult?: StrategyRunResult;
   setView: (view: AppView) => void;
+  setHelpOpen: (open: boolean) => void;
+  setAlertsOpen: (open: boolean) => void;
+  toggleSidebar: () => void;
   setPortfolio: (portfolioId: string) => void;
   setScenario: (scenarioId: ScenarioId) => void;
   setMode: (mode: GameMode) => void;
@@ -127,12 +137,18 @@ function buildInitialState(
 
 export const useSimulationStore = create<SimulationStore>((set, get) => ({
   activeView: "dashboard",
+  isHelpOpen: false,
+  isAlertsOpen: false,
+  isSidebarCollapsed: false,
   ...buildInitialState(),
   setView: (view) =>
     set((state) => ({
       activeView: view,
       mode: view === "replay" ? "replay" : state.mode === "replay" ? "manual" : state.mode,
     })),
+  setHelpOpen: (open) => set({ isHelpOpen: open }),
+  setAlertsOpen: (open) => set({ isAlertsOpen: open }),
+  toggleSidebar: () => set((state) => ({ isSidebarCollapsed: !state.isSidebarCollapsed })),
   setPortfolio: (portfolioId) => {
     const state = get();
     const parsedPortfolioId = parsePortfolioId(portfolioId);
