@@ -23,7 +23,7 @@
     "clsx": "^2.1.1",
     "lucide-react": "^1.16.0",
     "motion": "^12.40.0",
-    "next": "16.2.6",
+    "next": "^16.2.11",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "recharts": "^3.8.1",
@@ -44,5 +44,10 @@
     "tailwindcss": "^4",
     "typescript": "^5",
     "vitest": "^4.1.7"
+  },
+  "overrides": {
+    "hono": "^4.12.27",
+    "postcss": "^8.5.18",
+    "vite": "^8.0.16"
   }
 }
