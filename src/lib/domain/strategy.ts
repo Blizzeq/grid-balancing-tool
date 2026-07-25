@@ -1,5 +1,10 @@
 import { settleContractsForPeriod } from "./contracts";
-import { buildDayAheadAuctionTrades, buildKnownPeriodView, executeOrder } from "./markets";
+import {
+  buildDayAheadAuctionTrades,
+  buildKnownPeriodView,
+  consumedLiquidityMwh,
+  executeOrder,
+} from "./markets";
 import { settlePortfolio, settleTradesForPeriod } from "./settlement";
 import type {
   Contract,
@@ -117,6 +122,12 @@ export function runAutopilot(
   const doNothing = settlePortfolio(scenario.periods, contracts, settlementTrades);
 
   for (let currentPeriod = 0; currentPeriod < scenario.periods.length; currentPeriod += 1) {
+    // Only the book as it stood at this point in the day. A contract signed at
+    // 10:00 cannot have hedged the 07:00 delivery, and re-running the script
+    // over the whole day against the final book let it do exactly that.
+    const bookAtPeriod = contracts.filter(
+      (contract) => contract.signedAtPeriod <= currentPeriod
+    );
     const horizonEnd = Math.min(
       currentPeriod + config.horizonPeriods,
       scenario.periods.length - 1
@@ -132,7 +143,7 @@ export function runAutopilot(
       const order = createRecommendedOrder(
         period,
         knownPeriod,
-        contracts,
+        bookAtPeriod,
         settlementTrades,
         currentPeriod,
         config
@@ -147,7 +158,8 @@ export function runAutopilot(
         period,
         currentPeriod,
         "script",
-        scriptTrades.length
+        scriptTrades.length,
+        consumedLiquidityMwh(settlementTrades, order.periodIndex)
       );
 
       if (execution.trade) {

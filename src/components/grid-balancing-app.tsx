@@ -20,6 +20,7 @@ import {
   RotateCcwIcon,
   ScrollTextIcon,
   ShieldCheckIcon,
+  TrendingUpIcon,
   SparklesIcon,
   StepForwardIcon,
   XIcon,
@@ -2557,6 +2558,10 @@ function replayKindLabel(kind: ReplayTimelineKind | "all"): string {
     return "Good hedge";
   }
 
+  if (kind === "human-edge") {
+    return "Your edge";
+  }
+
   return "All";
 }
 
@@ -2571,6 +2576,10 @@ function replayEventIcon(kind: ReplayTimelineKind): LucideIcon {
 
   if (kind === "good-hedge") {
     return ShieldCheckIcon;
+  }
+
+  if (kind === "human-edge") {
+    return TrendingUpIcon;
   }
 
   return FileSignatureIcon;
@@ -3946,8 +3955,10 @@ function ReplayView() {
     0
   );
   const scriptGap = visibleScriptPnl - visibleManualPnl;
+  // Signed. Summing only the periods the script won produced a number that
+  // stayed positive even when the player was ahead overall.
   const avoidableCost = periodInsights.reduce(
-    (sum, insight) => sum + Math.max(insight.pnlGapToScript ?? 0, 0),
+    (sum, insight) => sum + (insight.pnlGapToScript ?? 0),
     0
   );
   const worstInsight = [...periodInsights].sort(
@@ -3958,6 +3969,7 @@ function ReplayView() {
     "all",
     "manual-decision",
     "bot-edge",
+    "human-edge",
     "imbalance-leak",
     "good-hedge",
   ];

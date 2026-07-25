@@ -119,7 +119,11 @@ export function createDefaultContracts(
   );
 }
 
-export function createContractFromTemplate(templateId: string, suffix: string): Contract {
+export function createContractFromTemplate(
+  templateId: string,
+  suffix: string,
+  signedAtPeriod = -1
+): Contract {
   const template = CONTRACT_TEMPLATES.find((candidate) => candidate.templateId === templateId);
 
   if (!template) {
@@ -129,6 +133,7 @@ export function createContractFromTemplate(templateId: string, suffix: string): 
   return {
     ...template,
     id: `${template.templateId}-${suffix}`,
+    signedAtPeriod,
   };
 }
 

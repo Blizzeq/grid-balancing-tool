@@ -25,6 +25,7 @@ import {
   executeOrder,
   getScenarioSetupTrades,
   quoteRdbOrder,
+  GATE_CLOSURE_LEAD_PERIODS,
 } from "../markets";
 import { buildDashboardMetrics, getTradablePeriods } from "../metrics";
 import { PORTFOLIOS, getPortfolioDefinition, parsePortfolioId } from "../portfolios";
@@ -86,6 +87,7 @@ function fixedContract(
     penaltyRule: "None",
     settlementRule: "Fixed profile",
     serviceFeePerMwh: 0,
+    signedAtPeriod: -1,
   };
 }
 
@@ -363,8 +365,11 @@ describe("grid balancing simulation", () => {
     const scenario = createScenario("sunny-negative");
     const periods = getTradablePeriods(scenario, 43);
 
-    expect(periods[0].index).toBe(44);
-    expect(periods.every((period) => period.index > 43)).toBe(true);
+    // Intraday trading closes a period before delivery, so 44 — which begins
+    // the moment 43 ends — is already gated. The autopilot has always kept
+    // this margin; the human side used to be allowed to trade into it.
+    expect(periods[0].index).toBe(45);
+    expect(periods.every((period) => period.index > 44)).toBe(true);
   });
 
   it("settles surplus and deficit energy at one price, in both directions", () => {
@@ -789,7 +794,7 @@ describe("grid balancing simulation", () => {
   it("places executable future orders through the store and updates trade state", () => {
     useSimulationStore.getState().resetScenario();
     const state = useSimulationStore.getState();
-    const targetPeriod = state.currentPeriod + 1;
+    const targetPeriod = state.currentPeriod + GATE_CLOSURE_LEAD_PERIODS + 1;
     const period = state.scenario.periods[targetPeriod];
 
     state.setSelectedPeriod(targetPeriod);

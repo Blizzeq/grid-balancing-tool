@@ -1,4 +1,4 @@
-import { buildKnownPeriodView, executeOrder } from "./markets";
+import { buildKnownPeriodView, consumedLiquidityMwh, executeOrder } from "./markets";
 import { settlePeriod } from "./settlement";
 import type {
   Contract,
@@ -143,7 +143,14 @@ export function buildOrderImpactPreview(
     currentPeriod,
     period.index
   );
-  const execution = executeOrder(draft, period, currentPeriod, "manual", trades.length);
+  const execution = executeOrder(
+    draft,
+    period,
+    currentPeriod,
+    "manual",
+    trades.length,
+    consumedLiquidityMwh(trades, draft.periodIndex)
+  );
 
   if (!execution.trade) {
     return {
@@ -521,10 +528,14 @@ export function buildStrategyDuelInsights(
     manualTrades.filter((trade) => trade.actor === "manual")
   );
   const scriptByPeriod = aggregateRdbTradesByPeriod(scriptTrades);
-  const candidatePeriods = new Set<number>([
-    ...Array.from(manualByPeriod.keys()),
-    ...Array.from(scriptByPeriod.keys()),
-  ]);
+  // Only periods the player has actually reached can be judged. Without this
+  // the panel reported "missed" trades for deliveries still fourteen hours
+  // away — at 05:15 it would tell you what you should have done about 20:45.
+  const candidatePeriods = new Set<number>(
+    [...Array.from(manualByPeriod.keys()), ...Array.from(scriptByPeriod.keys())].filter(
+      (periodIndex) => periodIndex <= currentPeriod
+    )
+  );
 
   return Array.from(candidatePeriods)
     .map((periodIndex) => {
@@ -591,8 +602,12 @@ export function buildScenarioDecisionReport(
     totalRiskCutMwh: round(
       accepted.reduce((sum, entry) => sum + Math.max(entry.imbalanceReductionMwh, 0), 0)
     ),
+    // Signed, not clamped at zero. Summing only the periods where the script
+    // did better is a max-over-noise statistic: it comes out positive even
+    // against a coin-flip opponent, so the panel was unwinnable by
+    // construction and never showed the periods the player won.
     avoidableImbalanceCost: scriptSettlement
-      ? round(Math.max(scriptSettlement.imbalancePnl - manualSettlement.imbalancePnl, 0))
+      ? round(scriptSettlement.imbalancePnl - manualSettlement.imbalancePnl)
       : 0,
     totalPnlGapToScript: scriptSettlement
       ? round(scriptSettlement.totalPnl - manualSettlement.totalPnl)

@@ -11,7 +11,8 @@ export type ReplayTimelineKind =
   | "manual-decision"
   | "bot-edge"
   | "imbalance-leak"
-  | "good-hedge";
+  | "good-hedge"
+  | "human-edge";
 
 export type ReplayTone = "positive" | "warning" | "negative" | "neutral";
 
@@ -298,6 +299,32 @@ function botEdgeEvents(
     });
 }
 
+/**
+ * Periods where the player beat the script.
+ *
+ * The timeline only ever surfaced the script's wins, and the headline number
+ * summed only those, clamped at zero. That is a max-over-noise statistic — it
+ * stays positive even against a coin-flip opponent — so the panel could not be
+ * won and the player never saw the calls they got right.
+ */
+function humanEdgeEvents(insights: ReplayPeriodInsight[]): ReplayTimelineEvent[] {
+  return insights
+    .filter((insight) => (insight.pnlGapToScript ?? 0) < -100)
+    .sort((left, right) => (left.pnlGapToScript ?? 0) - (right.pnlGapToScript ?? 0))
+    .slice(0, 5)
+    .map((insight) => ({
+      id: `human-edge-${insight.periodIndex}`,
+      periodIndex: insight.periodIndex,
+      label: insight.label,
+      kind: "human-edge",
+      title: "You beat the script",
+      description: insight.recommendation,
+      pnlImpact: Math.abs(insight.pnlGapToScript ?? 0),
+      riskImpactMwh: 0,
+      tone: "positive",
+    }));
+}
+
 function imbalanceLeakEvents(
   insights: ReplayPeriodInsight[],
   currency: CurrencyCode
@@ -343,6 +370,7 @@ export function buildReplayTimeline(input: ReplayAnalysisInput): ReplayTimelineE
   return [
     ...decisionEvents(input.decisionLog, visibleCurrentPeriod),
     ...botEdgeEvents(insights, duelInsights),
+    ...humanEdgeEvents(insights),
     ...imbalanceLeakEvents(insights, input.scenario.metadata.currency),
   ]
     .sort((left, right) => {

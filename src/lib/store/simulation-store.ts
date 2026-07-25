@@ -350,7 +350,11 @@ export const useSimulationStore = create<SimulationStore>((set, get) => ({
     set({
       contracts: [
         ...state.contracts,
-        createContractFromTemplate(templateId, `manual-${state.contracts.length + 1}`),
+        createContractFromTemplate(
+          templateId,
+          `manual-${state.contracts.length + 1}`,
+          state.currentPeriod
+        ),
       ],
       statusMessage: `${template.name} signed. Recalculate your open imbalance before gate closure.`,
       botResult: undefined,

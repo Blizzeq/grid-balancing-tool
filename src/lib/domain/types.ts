@@ -198,9 +198,18 @@ export interface Contract {
   penaltyRule: string;
   settlementRule: string;
   serviceFeePerMwh: number;
+  /**
+   * Period the contract entered the book; -1 for the D-1 seed book.
+   *
+   * A benchmark strategy has to be replayed against the book as it stood at
+   * each decision time. Without this the autopilot was re-run from period 0
+   * against contracts signed mid-game and retroactively hedged deliveries
+   * whose gate had already closed.
+   */
+  signedAtPeriod: number;
 }
 
-export interface ContractTemplate extends Omit<Contract, "id"> {
+export interface ContractTemplate extends Omit<Contract, "id" | "signedAtPeriod"> {
   rationale: string;
   risk: string;
 }

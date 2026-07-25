@@ -3,6 +3,7 @@ import {
   evaluateContractVolume,
 } from "./contracts";
 import {
+  GATE_CLOSURE_LEAD_PERIODS,
   buildKnownMarketTape,
   buildKnownPeriodView,
   buildScenarioCalibrationReport,
@@ -237,7 +238,10 @@ export function buildRiskAlerts(
 
 export function getTradablePeriods(scenario: Scenario, currentPeriod: number) {
   return scenario.periods.slice(
-    Math.min(clampPeriodIndex(currentPeriod, scenario) + 1, scenario.periods.length),
+    Math.min(
+      clampPeriodIndex(currentPeriod, scenario) + GATE_CLOSURE_LEAD_PERIODS + 1,
+      scenario.periods.length
+    ),
     scenario.periods.length
   );
 }

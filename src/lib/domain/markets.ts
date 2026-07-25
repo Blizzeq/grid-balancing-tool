@@ -15,6 +15,15 @@ const TRANSACTION_FEE_PLN_MWH = 0.75;
 const DAY_AHEAD_HEDGE_RATIO = 0.78;
 const MIN_EXECUTABLE_RDB_MWH = 0.1;
 const RDB_DEPTH_VOLUME_SHARES = [0.35, 0.35, 0.3] as const;
+/**
+ * Periods of lead time before delivery that intraday trading closes.
+ *
+ * One 15-minute period. The rule used to be "anything after the current
+ * period", which let a participant trade a delivery that began the instant the
+ * current one ended — a gate closure of zero. It also gave the human an edge
+ * the autopilot never took, since the script already keeps a period in hand.
+ */
+export const GATE_CLOSURE_LEAD_PERIODS = 1;
 
 export interface OrderExecution {
   accepted: boolean;
@@ -84,6 +93,25 @@ function expectedImbalancePrice(period: PeriodSnapshot): number {
   const tilt = clamp(tightness / reference, -1, 1);
 
   return round(period.rdnPrice + tilt * 42);
+}
+
+/**
+ * Volume already executed against a delivery period's intraday book.
+ *
+ * Depth is finite: what has been taken is gone until the next period. Without
+ * this the same liquidity could be lifted repeatedly and size never cost
+ * anything.
+ */
+export function consumedLiquidityMwh(trades: MarketTrade[], periodIndex: number): number {
+  return round(
+    trades
+      .filter(
+        (trade) =>
+          trade.accepted && trade.market === "RDB" && trade.periodIndex === periodIndex
+      )
+      .reduce((sum, trade) => sum + trade.volumeMwh, 0),
+    1
+  );
 }
 
 export function createTradeId(actor: MarketTrade["actor"], periodIndex: number, count: number) {
@@ -190,17 +218,23 @@ export function buildScenarioCalibrationReport(
   };
 }
 
-export function buildRdbDepth(period: PeriodSnapshot): RdbBookLevel[] {
+/**
+ * @param consumedMwh volume already executed in this delivery period. The book
+ *   used to regenerate at full size for every order, so the same 28 MWh could
+ *   be bought over and over and depth was never a constraint.
+ */
+export function buildRdbDepth(period: PeriodSnapshot, consumedMwh = 0): RdbBookLevel[] {
   const spread = Math.max(period.intradayAsk - period.intradayBid, 1);
   const priceStep = Math.max(2, spread * 0.2);
-  let remainingVolume = period.liquidityMwh;
+  const available = Math.max(round(period.liquidityMwh - consumedMwh, 1), 0);
+  let remainingVolume = available;
 
   return RDB_DEPTH_VOLUME_SHARES.map((share, index) => {
     const level = index + 1;
     const volumeMwh =
       index === RDB_DEPTH_VOLUME_SHARES.length - 1
         ? remainingVolume
-        : round(period.liquidityMwh * share, 1);
+        : round(available * share, 1);
 
     remainingVolume = round(Math.max(0, remainingVolume - volumeMwh), 1);
 
@@ -209,16 +243,17 @@ export function buildRdbDepth(period: PeriodSnapshot): RdbBookLevel[] {
       bidPrice: round(period.intradayBid - priceStep * index),
       askPrice: round(period.intradayAsk + priceStep * index),
       volumeMwh: round(volumeMwh, 1),
-      cumulativeVolumeMwh: round(
-        period.liquidityMwh - remainingVolume,
-        1
-      ),
+      cumulativeVolumeMwh: round(available - remainingVolume, 1),
     };
   });
 }
 
-export function quoteRdbOrder(draft: OrderDraft, period: PeriodSnapshot): RdbExecutionQuote {
-  const depth = buildRdbDepth(period);
+export function quoteRdbOrder(
+  draft: OrderDraft,
+  period: PeriodSnapshot,
+  consumedMwh = 0
+): RdbExecutionQuote {
+  const depth = buildRdbDepth(period, consumedMwh);
   const midpointPricePlnMwh = (period.intradayBid + period.intradayAsk) / 2;
   const bestPricePlnMwh = draft.side === "buy" ? depth[0]?.askPrice ?? 0 : depth[0]?.bidPrice ?? 0;
   const fills: RdbFillLevel[] = [];
@@ -296,7 +331,8 @@ export function executeOrder(
   period: PeriodSnapshot,
   submittedAtPeriod: number,
   actor: MarketTrade["actor"],
-  tradeCount: number
+  tradeCount: number,
+  consumedMwh = 0
 ): OrderExecution {
   const parsed = orderDraftSchema.safeParse(draft);
 
@@ -314,14 +350,14 @@ export function executeOrder(
     };
   }
 
-  if (draft.periodIndex <= submittedAtPeriod) {
+  if (draft.periodIndex <= submittedAtPeriod + GATE_CLOSURE_LEAD_PERIODS) {
     return {
       accepted: false,
-      reason: "Gate closure: current and past 15-minute periods are already locked.",
+      reason: "Gate closure: intraday trading for this delivery period has closed.",
     };
   }
 
-  const quote = quoteRdbOrder(draft, period);
+  const quote = quoteRdbOrder(draft, period, consumedMwh);
 
   if (quote.filledVolumeMwh < MIN_EXECUTABLE_RDB_MWH) {
     const bestPrice = draft.side === "buy" ? "ask" : "bid";
