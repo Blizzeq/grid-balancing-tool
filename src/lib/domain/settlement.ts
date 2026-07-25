@@ -10,8 +10,7 @@ import type {
 } from "./types";
 
 interface SettlementPriceOverride {
-  imbalanceLongPrice?: number;
-  imbalanceShortPrice?: number;
+  imbalancePrice?: number;
 }
 
 function round(value: number, precision = 2): number {
@@ -68,14 +67,12 @@ export function settlePeriod(
   const contractedPosition = contractSettlement.boughtMwh - contractSettlement.soldMwh;
   const marketPosition = tradeSettlement.boughtMwh - tradeSettlement.soldMwh;
   const imbalanceMwh = boughtMwh - soldMwh;
-  const imbalanceLongPrice = priceOverride.imbalanceLongPrice ?? period.imbalanceLongPrice;
-  const imbalanceShortPrice = priceOverride.imbalanceShortPrice ?? period.imbalanceShortPrice;
-  const imbalancePrice =
-    imbalanceMwh >= 0 ? imbalanceLongPrice : imbalanceShortPrice;
-  const imbalancePnl =
-    imbalanceMwh >= 0
-      ? imbalanceMwh * imbalanceLongPrice
-      : -Math.abs(imbalanceMwh) * imbalanceShortPrice;
+  const imbalancePrice = priceOverride.imbalancePrice ?? period.imbalancePrice;
+  // One price, one formula. A long position (imbalanceMwh > 0) hands surplus
+  // to the system and is paid for it; a short one is supplied and pays. Which
+  // of those is profitable depends on where CEN sits relative to the day-ahead
+  // price, and that is decided by the system's direction — not by yours.
+  const imbalancePnl = imbalanceMwh * imbalancePrice;
   const periodPnl = contractSettlement.pnl + tradeSettlement.pnl + imbalancePnl;
 
   return {

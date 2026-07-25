@@ -61,10 +61,20 @@ function createRecommendedOrder(
     return null;
   }
 
+  // Under a single imbalance price, closing is not automatically right.
+  // Selling a surplus intraday earns the bid; leaving it open earns the
+  // imbalance price. Closing only pays when the bid beats that estimate by
+  // more than it costs to trade — and when the period is expected to settle
+  // above the bid, holding the position is the better call.
+  //
+  // The previous test compared the bid against an "expected long price" that
+  // was constructed a full spread below the day-ahead price, so it was true in
+  // every period of every scenario. The bot was a fixed "always flatten" rule
+  // wearing the costume of a price decision.
   if (expectedNet > 0) {
     const shouldSell =
       knownPeriod.intradayBid >
-      knownPeriod.expectedImbalanceLongPrice + config.transactionCostPlnMwh;
+      knownPeriod.expectedImbalancePrice + config.transactionCostPlnMwh;
 
     if (!shouldSell) {
       return null;
@@ -81,7 +91,7 @@ function createRecommendedOrder(
 
   const shouldBuy =
     knownPeriod.intradayAsk <
-    knownPeriod.expectedImbalanceShortPrice - config.transactionCostPlnMwh;
+    knownPeriod.expectedImbalancePrice - config.transactionCostPlnMwh;
 
   if (!shouldBuy) {
     return null;

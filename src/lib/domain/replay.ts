@@ -83,10 +83,7 @@ function expectedPriceOverride(
   const knownPeriod = buildKnownPeriodView(scenario, currentPeriod, periodIndex);
 
   return {
-    imbalanceLongPrice:
-      knownPeriod.actualImbalanceLongPrice ?? knownPeriod.expectedImbalanceLongPrice,
-    imbalanceShortPrice:
-      knownPeriod.actualImbalanceShortPrice ?? knownPeriod.expectedImbalanceShortPrice,
+    imbalancePrice: knownPeriod.actualImbalancePrice ?? knownPeriod.expectedImbalancePrice,
   };
 }
 

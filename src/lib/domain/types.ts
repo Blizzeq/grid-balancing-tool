@@ -59,8 +59,27 @@ export interface PeriodSnapshot {
   spotPrice: number;
   intradayBid: number;
   intradayAsk: number;
-  imbalanceLongPrice: number;
-  imbalanceShortPrice: number;
+  /**
+   * System-wide imbalance for the period, in MW. Positive means the system is
+   * long (surplus), negative means it is short. This is the sign that decides
+   * the imbalance price — not the sign of any single participant's position.
+   */
+  systemImbalanceMw: number;
+  /** Balancing energy price (CEB) — the ex-post cost of the balancing stack. */
+  balancingEnergyPrice: number;
+  /**
+   * Single imbalance price (cena energii niezbilansowania, CEN).
+   *
+   * Poland settles both directions at one price, per the balancing market
+   * rules in force since 14 June 2024:
+   *   system long  (SK > 0) → CEN = min(CEB, day-ahead)
+   *   system short (SK < 0) → CEN = max(CEB, day-ahead)
+   * So a participant whose position helps the system is rewarded relative to
+   * the day-ahead price and one that deepens the gap pays for it. The previous
+   * model used two prices chosen by the participant's own sign, which made
+   * every imbalance a guaranteed loss and inverted the incentive.
+   */
+  imbalancePrice: number;
   liquidityMwh: number;
   weather: WeatherPoint;
 }
@@ -102,10 +121,12 @@ export interface KnownPeriodView {
   intradayBid: number;
   intradayAsk: number;
   liquidityMwh: number;
-  expectedImbalanceLongPrice: number;
-  expectedImbalanceShortPrice: number;
-  actualImbalanceLongPrice: number | null;
-  actualImbalanceShortPrice: number | null;
+  /** Ex-ante estimate available before delivery. */
+  expectedImbalancePrice: number;
+  /** Realised CEN, only once the period has settled. */
+  actualImbalancePrice: number | null;
+  /** Realised system direction (sign of SK), only once settled. */
+  actualSystemImbalanceMw: number | null;
   isSettled: boolean;
   weather: WeatherPoint;
 }

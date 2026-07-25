@@ -33,7 +33,7 @@ import {
   buildReplayTimeline,
   buildScenarioLessons,
 } from "../replay";
-import { createDefaultScenarioConfig, createScenario } from "../scenarios";
+import { createDefaultScenarioConfig, createScenario, SCENARIOS } from "../scenarios";
 import { settlePeriod, settlePortfolio } from "../settlement";
 import { runAutopilot } from "../strategy";
 import { useSimulationStore } from "../../store/simulation-store";
@@ -51,8 +51,9 @@ const basePeriod: PeriodSnapshot = {
   spotPrice: 120,
   intradayBid: 118,
   intradayAsk: 122,
-  imbalanceLongPrice: 80,
-  imbalanceShortPrice: 300,
+  systemImbalanceMw: -180,
+  balancingEnergyPrice: 300,
+  imbalancePrice: 300,
   liquidityMwh: 30,
   weather: {
     cloudCover: 0.2,
@@ -87,6 +88,8 @@ function fixedContract(
     serviceFeePerMwh: 0,
   };
 }
+
+const scenarioPeriodCount = 96;
 
 describe("grid balancing simulation", () => {
   it("generates deterministic scenario periods for the same seed", () => {
@@ -192,6 +195,73 @@ describe("grid balancing simulation", () => {
     );
   });
 
+  it("keeps forecast error centred so no standing rule can win the day", () => {
+    // The generator used to over-predict PV and wind and under-predict load in
+    // every scenario, which left the book short in 77-97% of periods. That made
+    // "always buy" the winning strategy everywhere and taught the wrong reflex.
+    for (const definition of SCENARIOS) {
+      const periods = createScenario(definition.id).periods;
+      const netError = periods.map(
+        (period) =>
+          period.actualGeneration -
+          period.forecastGeneration -
+          (period.actualLoad - period.forecastLoad)
+      );
+      const meanError = netError.reduce((sum, value) => sum + value, 0) / netError.length;
+      const shortShare = netError.filter((value) => value < 0).length / netError.length;
+
+      expect(Math.abs(meanError), `${definition.id} mean net forecast error`).toBeLessThan(0.6);
+      expect(shortShare, `${definition.id} share of short periods`).toBeGreaterThan(0.3);
+      expect(shortShare, `${definition.id} share of short periods`).toBeLessThan(0.7);
+    }
+  });
+
+  it("prices the day-ahead independently of this book's own outturn", () => {
+    // A book this size is a price taker. The day-ahead price used to be derived
+    // from the portfolio's own actualLoad and actual generation, which put the
+    // realised result into the price before any decision was made.
+    const periods = createScenario("wind-drop").periods;
+    const price = periods.map((period) => period.rdnPrice);
+    const bookError = periods.map(
+      (period) =>
+        period.actualGeneration -
+        period.forecastGeneration -
+        (period.actualLoad - period.forecastLoad)
+    );
+    const mean = (values: number[]) => values.reduce((sum, v) => sum + v, 0) / values.length;
+    const meanPrice = mean(price);
+    const meanError = mean(bookError);
+    const covariance = price.reduce(
+      (sum, _, index) => sum + (price[index] - meanPrice) * (bookError[index] - meanError),
+      0
+    );
+    const spread = (values: number[], centre: number) =>
+      Math.sqrt(values.reduce((sum, v) => sum + (v - centre) ** 2, 0));
+    const correlation = covariance / (spread(price, meanPrice) * spread(bookError, meanError));
+
+    expect(Math.abs(correlation)).toBeLessThan(0.3);
+  });
+
+  it("lets the autopilot decline to trade when closing is not worth it", () => {
+    // The bot's economic test compared the intraday quote against an expected
+    // imbalance price built a full spread away from the day-ahead price, so it
+    // was true in every period of every scenario — an "always flatten" rule
+    // dressed up as a price decision. Under a single imbalance price, holding a
+    // position is sometimes correct, and the bot has to be able to choose it.
+    const contracts = createDefaultContracts();
+    const declined = SCENARIOS.map((definition) => {
+      const scenario = createScenario(definition.id);
+      const setupTrades = getScenarioSetupTrades(
+        buildDayAheadAuctionTrades(scenario, contracts)
+      );
+
+      return runAutopilot(scenario, contracts, undefined, setupTrades).trades.length;
+    });
+
+    expect(declined.every((count) => count > 0)).toBe(true);
+    expect(declined.some((count) => count < scenarioPeriodCount)).toBe(true);
+  });
+
   it("keeps calibrated scenario ranges realistic for v1", () => {
     const sunny = buildScenarioCalibrationReport(createScenario("sunny-negative"));
     const pvOversupply = createScenario("pv-oversupply");
@@ -212,7 +282,7 @@ describe("grid balancing simulation", () => {
       pvOversupply.periods.slice(68, 84).reduce((sum, period) => sum + period.rdnPrice, 0) / 16;
 
     expect(sunny.negativeRdnPeriods).toBeGreaterThanOrEqual(16);
-    expect(sunny.negativeRdnPeriods).toBeLessThanOrEqual(28);
+    expect(sunny.negativeRdnPeriods).toBeLessThanOrEqual(34);
     expect(pvReport.negativeRdnPeriods).toBeGreaterThan(0);
     expect(pvMiddayAverage).toBeLessThan(pvEveningAverage);
     expect(winterReport.averageRdnPrice).toBeGreaterThan(650);
@@ -235,7 +305,9 @@ describe("grid balancing simulation", () => {
         createScenario(scenarioId).periods.every(
           (period) =>
             period.intradayBid <= period.intradayAsk &&
-            period.imbalanceShortPrice > period.imbalanceLongPrice
+            (period.systemImbalanceMw > 0
+              ? period.imbalancePrice <= period.rdnPrice + 0.01
+              : period.imbalancePrice >= period.rdnPrice - 0.01)
         )
       ).toBe(true);
     }
@@ -295,7 +367,9 @@ describe("grid balancing simulation", () => {
     expect(periods.every((period) => period.index > 43)).toBe(true);
   });
 
-  it("settles surplus and deficit energy with the correct PnL signs", () => {
+  it("settles surplus and deficit energy at one price, in both directions", () => {
+    // basePeriod: system short (systemImbalanceMw -180), so CEN = 300 sits
+    // above the day-ahead price of 120 — the system pays up for energy.
     const surplus = settlePeriod(basePeriod, [
       fixedContract("buy-10", "buy", 10, 100),
       fixedContract("sell-8", "sell", 8, 150),
@@ -305,12 +379,39 @@ describe("grid balancing simulation", () => {
       fixedContract("sell-8", "sell", 8, 150),
     ], []);
 
+    // A long book into a short system is PAID above the day-ahead price. Under
+    // the old dual-price model this was always a loss, whatever the system was
+    // doing — which inverted the incentive the mechanism exists to create.
     expect(surplus.imbalanceMwh).toBe(2);
-    expect(surplus.imbalancePnl).toBe(160);
-    expect(surplus.periodPnl).toBe(360);
+    expect(surplus.imbalancePrice).toBe(300);
+    expect(surplus.imbalancePnl).toBe(600);
+
+    // A short book into a short system pays that same price.
     expect(deficit.imbalanceMwh).toBe(-3);
+    expect(deficit.imbalancePrice).toBe(300);
     expect(deficit.imbalancePnl).toBe(-900);
-    expect(deficit.periodPnl).toBe(-200);
+
+    // One price, one formula: PnL is linear through zero.
+    expect(surplus.imbalancePnl / surplus.imbalanceMwh).toBeCloseTo(
+      deficit.imbalancePnl / deficit.imbalanceMwh,
+      6
+    );
+  });
+
+  it("rewards the side that helps the system and charges the side that deepens the gap", () => {
+    const dayAhead = basePeriod.rdnPrice;
+    // System long: CEN is capped by the day-ahead price, so surplus is worth
+    // less than day-ahead and a short book buys back cheaply.
+    const systemLong = { ...basePeriod, systemImbalanceMw: 240, imbalancePrice: 70 };
+    const systemShort = basePeriod; // CEN 300 > day-ahead 120
+
+    const longBook = [fixedContract("buy-10", "buy", 10, 100), fixedContract("sell-8", "sell", 8, 150)];
+
+    const paidWhenSystemShort = settlePeriod(systemShort, longBook, []).imbalancePnl;
+    const paidWhenSystemLong = settlePeriod(systemLong, longBook, []).imbalancePnl;
+
+    expect(paidWhenSystemShort / 2).toBeGreaterThan(dayAhead);
+    expect(paidWhenSystemLong / 2).toBeLessThan(dayAhead);
   });
 
   it("settles contract templates with profile-specific volumes and prices", () => {
@@ -548,8 +649,7 @@ describe("grid balancing simulation", () => {
         period.index > 20
           ? {
               ...period,
-              imbalanceLongPrice: period.imbalanceLongPrice * 4,
-              imbalanceShortPrice: period.imbalanceShortPrice * 4,
+              imbalancePrice: period.imbalancePrice * 4,
             }
           : period
       ),
@@ -581,8 +681,7 @@ describe("grid balancing simulation", () => {
               ...period,
               actualGeneration: period.actualGeneration * 0.1,
               actualLoad: period.actualLoad * 2,
-              imbalanceLongPrice: period.imbalanceLongPrice * 5,
-              imbalanceShortPrice: period.imbalanceShortPrice * 5,
+              imbalancePrice: period.imbalancePrice * 5,
             }
           : period
       ),
@@ -803,9 +902,41 @@ describe("grid balancing simulation", () => {
     const scenario = createScenario("wind-drop");
     const contracts = createDefaultContracts();
     const setupTrades = buildDayAheadAuctionTrades(scenario, contracts);
-    const best = pickBestDecisionCandidate(
-      buildDecisionCandidates(scenario, contracts, setupTrades, 43, 12)
-    );
+
+    // Under a single imbalance price, closing a position is not profitable in
+    // every period — that is the point of the model, so the period this test
+    // builds its timeline from has to be one where the trade actually pays.
+    // Pinning it to a fixed period would make the test assert something the
+    // simulator is no longer supposed to guarantee.
+    const profitable = [43, 40, 36, 32, 28, 48, 52, 56, 60]
+      .map((periodIndex) => {
+        const candidate = pickBestDecisionCandidate(
+          buildDecisionCandidates(scenario, contracts, setupTrades, periodIndex, 12)
+        );
+
+        if (!candidate.orderDraft) return null;
+
+        const impact = buildOrderImpactPreview(
+          scenario,
+          contracts,
+          setupTrades,
+          periodIndex,
+          candidate.orderDraft
+        );
+
+        return { periodIndex, candidate, impact };
+      })
+      .find(
+        (entry) =>
+          entry !== null &&
+          entry.impact.pnlImpact > 0 &&
+          entry.impact.imbalanceReductionMwh > 0
+      );
+
+    expect(profitable, "no period offers a profitable hedge").toBeDefined();
+
+    const decisionPeriod = profitable!.periodIndex;
+    const best = profitable!.candidate;
 
     expect(best.orderDraft).toBeDefined();
 
@@ -813,7 +944,7 @@ describe("grid balancing simulation", () => {
       scenario,
       contracts,
       setupTrades,
-      43,
+      decisionPeriod,
       best.orderDraft!
     );
     const decision = buildDecisionLogEntry(preview, "10:45", 0);
@@ -821,7 +952,7 @@ describe("grid balancing simulation", () => {
       scenario,
       contracts,
       setupTrades,
-      43,
+      decisionPeriod,
       {
         ...best.orderDraft!,
         market: "RDN",
@@ -909,8 +1040,7 @@ describe("grid balancing simulation", () => {
               ...period,
               actualGeneration: period.actualGeneration * 0.1,
               actualLoad: period.actualLoad * 2,
-              imbalanceLongPrice: period.imbalanceLongPrice * 5,
-              imbalanceShortPrice: period.imbalanceShortPrice * 5,
+              imbalancePrice: period.imbalancePrice * 5,
             }
           : period
       ),

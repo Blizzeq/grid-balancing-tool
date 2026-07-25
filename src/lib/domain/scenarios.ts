@@ -288,19 +288,25 @@ function createPeriod(
     1
   );
 
-  const pvForecast =
-    daylight * tuning.pvScale * 22 * (1 - cloudCover * 0.55) +
-    (rng() - 0.5) * 0.6;
-  const pvActual =
-    daylight * tuning.pvScale * 22 * (1 - cloudCover * 0.72) +
-    (rng() - 0.5) * 1.8 * tuning.volatility;
+  // Forecast and actual share the same cloud response. They used to differ
+  // (0.55 vs 0.72), which made actual PV fall short of forecast in almost
+  // every daylight period — a one-directional bias an operational forecaster
+  // would have corrected out within a week. The error now comes only from the
+  // noise terms, so it is centred and the day is not solvable by a standing
+  // rule.
+  const pvExpected = daylight * tuning.pvScale * 22 * (1 - cloudCover * 0.72);
+  const pvForecast = pvExpected + (rng() - 0.5) * 1.1;
+  const pvActual = pvExpected + (rng() - 0.5) * 2.4 * tuning.volatility;
 
-  const windForecast =
-    tuning.windScale *
-    clamp(((windSpeedMs + 0.8) / 13) ** 2 * 12, 1.5, 20);
-  const windActual =
-    tuning.windScale *
-    clamp((windSpeedMs / 13) ** 2 * 12 + (rng() - 0.5) * 2.8, 0.4, 21);
+  // Same wind speed drives both. The forecast used to be built from
+  // (windSpeedMs + 0.8), which meant it systematically over-predicted output.
+  const windExpected = tuning.windScale * clamp((windSpeedMs / 13) ** 2 * 12, 1.2, 20);
+  const windForecast = clamp(windExpected + (rng() - 0.5) * 1.6, 0.4, 21);
+  const windActual = clamp(
+    windExpected + (rng() - 0.5) * 3.2 * tuning.volatility,
+    0.4,
+    21
+  );
 
   const peakLoad =
     22 +
@@ -310,23 +316,35 @@ function createPeriod(
   const tempLoad = temperatureC < 2 ? Math.abs(temperatureC - 2) * 0.55 : 0;
   const forecastLoad =
     tuning.loadScale * (peakLoad + tempLoad + 2.2 * wave(index, 3));
+  // (rng() - 0.35) has mean +0.15, so actual load used to run above forecast
+  // roughly two periods in three. Centred on 0.5 the error is symmetric.
   const actualLoad =
     forecastLoad +
-    (rng() - 0.35) * 3.2 * tuning.volatility +
+    (rng() - 0.5) * 3.6 * tuning.volatility +
     (definition.id === "chaos-hard-mode" ? 2.6 * Math.sin(index / 2.5) : 0);
 
-  const renewablePressure = pvActual + windActual;
-  const demandPressure = actualLoad;
+  const priceVolatility = tuning.priceVolatility;
   const middayDip = daylight > 0.55 ? tuning.middayPriceDip * daylight : 0;
   const eveningScarcity = isEveningPeak(index) ? tuning.eveningScarcity : 0;
-  const priceVolatility = tuning.priceVolatility;
   const outagePremium =
     tuning.outageWindow && index >= tuning.outageWindow[0] && index <= tuning.outageWindow[1]
       ? 130 + (rng() - 0.5) * 45 * priceVolatility
       : 0;
+
+  // --- system level -------------------------------------------------------
+  // A book of this size is a price taker. The day-ahead fixing is set by the
+  // whole system against D-1 forecasts, so it must not be derived from this
+  // portfolio's own outturn — doing that put the realised result into the
+  // price before the trader had made a single decision.
+  const systemRenewableShape =
+    daylight * tuning.pvScale * 20 * (1 - cloudCover * 0.72) +
+    tuning.windScale * clamp((windSpeedMs / 13) ** 2 * 11, 1.2, 20);
+  const systemForecastResidual = tuning.loadScale * (peakLoad + tempLoad) - systemRenewableShape;
+  // The system's forecast error is its own, independent of the portfolio's.
+  const systemErrorMw = (rng() - 0.5) * 6.5 * tuning.volatility * priceVolatility;
+
   const scarcity =
-    Math.max(demandPressure - renewablePressure, 0) *
-    (9 + tuning.volatility * 2 * priceVolatility);
+    Math.max(systemForecastResidual, 0) * (9 + tuning.volatility * 2 * priceVolatility);
   const spotPrice =
     290 +
     tuning.priceShift +
@@ -337,6 +355,39 @@ function createPeriod(
     (rng() - 0.5) * 45 * tuning.volatility * priceVolatility;
   const rdnPrice = round(spotPrice, 2);
 
+  // Positive when the system ends up long. This sign, not the participant's,
+  // is what selects the imbalance price.
+  const systemImbalanceMw = round(-systemErrorMw * 150, 1);
+
+  // Balancing energy price: the ex-post cost of the balancing stack. It tracks
+  // how short the system is and has genuinely fat tails — Poland saw evening
+  // CEN above 1,000 PLN/MWh in 2025 and a record -36,932.50 PLN/MWh on
+  // 30 July 2025, so a bounded affine function of the day-ahead price carried
+  // no risk at all.
+  const stress = -systemImbalanceMw / 400;
+  const tail = rng();
+  const spike =
+    tail > 0.985
+      ? (900 + rng() * 2600) * priceVolatility
+      : tail < 0.015
+        ? -(700 + rng() * 2200) * priceVolatility
+        : 0;
+  const balancingEnergyPrice = round(
+    spotPrice +
+      stress * (95 + tuning.volatility * 40 * priceVolatility) +
+      (rng() - 0.5) * 70 * priceVolatility +
+      spike,
+    2
+  );
+
+  // Single price, both directions (see PeriodSnapshot.imbalancePrice).
+  const imbalancePrice = round(
+    systemImbalanceMw > 0
+      ? Math.min(balancingEnergyPrice, rdnPrice)
+      : Math.max(balancingEnergyPrice, rdnPrice),
+    2
+  );
+
   const spread = clamp(
     12 +
       tuning.volatility * 11 * priceVolatility +
@@ -344,10 +395,6 @@ function createPeriod(
     8,
     68 + Math.max(priceVolatility - 1, 0) * 24
   );
-  const imbalancePremium =
-    35 + tuning.volatility * 28 * priceVolatility + (isEveningPeak(index) ? 45 : 0);
-  const longDiscount =
-    28 + tuning.volatility * 18 * priceVolatility + (daylight > 0.6 ? 24 : 0);
 
   return {
     index,
@@ -361,8 +408,9 @@ function createPeriod(
     spotPrice: rdnPrice,
     intradayBid: round(spotPrice - spread / 2, 2),
     intradayAsk: round(spotPrice + spread / 2, 2),
-    imbalanceLongPrice: round(spotPrice - longDiscount, 2),
-    imbalanceShortPrice: round(spotPrice + imbalancePremium, 2),
+    systemImbalanceMw,
+    balancingEnergyPrice,
+    imbalancePrice,
     liquidityMwh: round(
       clamp(
         32 -

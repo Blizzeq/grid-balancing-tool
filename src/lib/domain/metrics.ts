@@ -46,10 +46,8 @@ function buildProjectedSettlement(
       trades,
       isSettled ? "actual" : "forecast",
       {
-        imbalanceLongPrice:
-          knownPeriod.actualImbalanceLongPrice ?? knownPeriod.expectedImbalanceLongPrice,
-        imbalanceShortPrice:
-          knownPeriod.actualImbalanceShortPrice ?? knownPeriod.expectedImbalanceShortPrice,
+        imbalancePrice:
+          knownPeriod.actualImbalancePrice ?? knownPeriod.expectedImbalancePrice,
       }
     );
   });

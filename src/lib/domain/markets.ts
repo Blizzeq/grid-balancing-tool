@@ -56,21 +56,34 @@ function round(value: number, precision = 2): number {
   return Number(value.toFixed(precision));
 }
 
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
 function clampPeriodIndex(index: number, scenario: Scenario): number {
   return Math.min(Math.max(index, 0), scenario.periods.length - 1);
 }
 
-function expectedImbalancePrices(period: PeriodSnapshot) {
-  const spread = Math.max(period.intradayAsk - period.intradayBid, 1);
-  const forecastSurplus = Math.max(period.forecastGeneration - period.forecastLoad, 0);
-  const forecastDeficit = Math.max(period.forecastLoad - period.forecastGeneration, 0);
-  const publicShortPremium = 34 + spread * 1.6 + forecastDeficit * 0.85;
-  const publicLongDiscount = 26 + spread * 1.15 + forecastSurplus * 0.65;
+/**
+ * Ex-ante estimate of the imbalance price, from information a participant
+ * actually has before delivery: the day-ahead price and the forecast tightness
+ * of the period.
+ *
+ * The previous version returned a long price a full spread *below* and a short
+ * price a full spread *above* the day-ahead price. That wedge grew with the
+ * spread, which made "close the position" arithmetically profitable in every
+ * period of every scenario — the autopilot's supposed economic test could
+ * never be false. The estimate now centres on the day-ahead price and only
+ * tilts with forecast tightness, so staying open is sometimes the better call,
+ * which is the actual intraday decision.
+ */
+function expectedImbalancePrice(period: PeriodSnapshot): number {
+  const tightness = period.forecastLoad - period.forecastGeneration;
+  const reference = (period.forecastLoad + period.forecastGeneration) / 2 || 1;
+  // Normalised: positive when the period looks short, negative when long.
+  const tilt = clamp(tightness / reference, -1, 1);
 
-  return {
-    expectedImbalanceLongPrice: round(period.rdnPrice - publicLongDiscount),
-    expectedImbalanceShortPrice: round(period.rdnPrice + publicShortPremium),
-  };
+  return round(period.rdnPrice + tilt * 42);
 }
 
 export function createTradeId(actor: MarketTrade["actor"], periodIndex: number, count: number) {
@@ -86,7 +99,7 @@ export function buildKnownPeriodView(
   const safeCurrentPeriod = clampPeriodIndex(currentPeriod, scenario);
   const period = scenario.periods[safeTargetPeriod];
   const isSettled = safeTargetPeriod <= safeCurrentPeriod;
-  const expectedPrices = expectedImbalancePrices(period);
+  const expectedPrice = expectedImbalancePrice(period);
 
   return {
     periodIndex: period.index,
@@ -100,10 +113,9 @@ export function buildKnownPeriodView(
     intradayBid: period.intradayBid,
     intradayAsk: period.intradayAsk,
     liquidityMwh: period.liquidityMwh,
-    expectedImbalanceLongPrice: expectedPrices.expectedImbalanceLongPrice,
-    expectedImbalanceShortPrice: expectedPrices.expectedImbalanceShortPrice,
-    actualImbalanceLongPrice: isSettled ? period.imbalanceLongPrice : null,
-    actualImbalanceShortPrice: isSettled ? period.imbalanceShortPrice : null,
+    expectedImbalancePrice: expectedPrice,
+    actualImbalancePrice: isSettled ? period.imbalancePrice : null,
+    actualSystemImbalanceMw: isSettled ? period.systemImbalanceMw : null,
     isSettled,
     weather: period.weather,
   };

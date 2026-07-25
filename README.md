@@ -33,6 +33,39 @@ The current market area is the Polish power market model. All monetary values
 settle in PLN, and the UI treats PLN as the fixed settlement currency rather
 than as an FX selector.
 
+## Market Model
+
+The settlement mechanics follow the Polish balancing model in force since
+14 June 2024, not a generic textbook one.
+
+**One imbalance price, both directions.** Poland settles imbalance at a single
+price (cena energii niezbilansowania) whose level is set by the direction of
+the *system*, not of your position:
+
+```
+system long  (SK > 0)  →  CEN = min(CEB, day-ahead)
+system short (SK < 0)  →  CEN = max(CEB, day-ahead)
+```
+
+So a book that is long while the system is short gets paid above the day-ahead
+price, and a book that is short while the system is long buys back below it.
+Being out of balance is not automatically a loss — being out of balance *in the
+same direction as the system* is. That asymmetry is the whole incentive, and it
+means closing a position intraday is a decision rather than a reflex: the
+spread and fees are certain, the imbalance outcome is not.
+
+**Forecast error is centred.** Generation and load forecasts are unbiased over
+the day. The risk is dispersion and ramp timing, not a standing tilt, so no
+single rule wins every scenario.
+
+**The day-ahead price is exogenous.** A book this size is a price taker, so the
+day-ahead curve is generated from a system-level residual load series with its
+own forecast error, independent of this portfolio's outturn.
+
+**The balancing energy price has tails.** CEB is a stochastic process around the
+day-ahead price with occasional spikes and crashes, so imbalance carries real
+risk rather than a fixed penalty.
+
 ## Product Screens
 
 ### Intraday Market
@@ -114,7 +147,8 @@ can override the target with `SMOKE_URL`.
 
 Core simulation logic lives in `src/lib/domain`:
 
-- `scenarios.ts` creates seeded weather, load, OZE, market, and imbalance curves.
+- `scenarios.ts` creates seeded weather, load, OZE, system-level residual,
+  day-ahead, balancing energy and imbalance curves.
 - `contracts.ts` evaluates physical contract volumes and prices.
 - `portfolios.ts` defines selectable portfolio books and default templates.
 - `markets.ts` validates RDB/SIDC orders, gate closure, depth, VWAP, fees, and

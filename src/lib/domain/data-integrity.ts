@@ -253,8 +253,9 @@ function validatePeriod(
     period.spotPrice,
     period.intradayBid,
     period.intradayAsk,
-    period.imbalanceLongPrice,
-    period.imbalanceShortPrice,
+    period.imbalancePrice,
+    period.balancingEnergyPrice,
+    period.systemImbalanceMw,
     period.liquidityMwh,
     period.weather.cloudCover,
     period.weather.irradiance,
@@ -280,8 +281,24 @@ function validatePeriod(
     addIssue(issues, "error", "scenarios", id, "Intraday bid must not exceed ask.");
   }
 
-  if (period.imbalanceShortPrice <= period.imbalanceLongPrice) {
-    addIssue(issues, "error", "scenarios", id, "Short imbalance price must exceed long imbalance price.");
+  // Under single pricing the imbalance price must sit on the correct side of
+  // the day-ahead price for the system's direction: capped by it when the
+  // system is long, floored by it when short. The old rule asserted that a
+  // short position always pays more than a long one, which is the dual-pricing
+  // assumption this model no longer makes.
+  const respectsSystemDirection =
+    period.systemImbalanceMw > 0
+      ? period.imbalancePrice <= period.rdnPrice + 0.01
+      : period.imbalancePrice >= period.rdnPrice - 0.01;
+
+  if (!respectsSystemDirection) {
+    addIssue(
+      issues,
+      "error",
+      "scenarios",
+      id,
+      "Imbalance price is on the wrong side of the day-ahead price for the system direction."
+    );
   }
 }
 

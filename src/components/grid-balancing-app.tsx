@@ -3106,15 +3106,21 @@ function MobileMarketPeriodCard({
           </div>
         </div>
         <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
-          <div className="text-muted-foreground">Long imb.</div>
+          <div className="text-muted-foreground">
+            Imbalance {period.actualImbalancePrice === null ? "(est.)" : ""}
+          </div>
           <div className="metric-tabular mt-1 break-words text-[12px]">
-            {formatPrice(period.actualImbalanceLongPrice ?? period.expectedImbalanceLongPrice)}
+            {formatPrice(period.actualImbalancePrice ?? period.expectedImbalancePrice)}
           </div>
         </div>
         <div className="min-w-0 rounded-md border border-border/50 bg-background/30 p-2">
-          <div className="text-muted-foreground">Short imb.</div>
+          <div className="text-muted-foreground">System</div>
           <div className="metric-tabular mt-1 break-words text-[12px]">
-            {formatPrice(period.actualImbalanceShortPrice ?? period.expectedImbalanceShortPrice)}
+            {period.actualSystemImbalanceMw === null
+              ? "—"
+              : `${period.actualSystemImbalanceMw > 0 ? "long" : "short"} ${formatMwh(
+                  Math.abs(period.actualSystemImbalanceMw)
+                )}`}
           </div>
         </div>
       </div>
@@ -3196,14 +3202,14 @@ function MarketView() {
                     {formatPrice(period.intradayAsk)}
                   </TableCell>
                   <TableCell className="metric-tabular">
-                    {formatPrice(
-                      period.actualImbalanceLongPrice ?? period.expectedImbalanceLongPrice
-                    )}
+                    {formatPrice(period.actualImbalancePrice ?? period.expectedImbalancePrice)}
                   </TableCell>
                   <TableCell className="metric-tabular">
-                    {formatPrice(
-                      period.actualImbalanceShortPrice ?? period.expectedImbalanceShortPrice
-                    )}
+                    {period.actualSystemImbalanceMw === null
+                      ? "—"
+                      : period.actualSystemImbalanceMw > 0
+                        ? "long"
+                        : "short"}
                   </TableCell>
                   <TableCell className="metric-tabular">{formatMwh(period.liquidityMwh)}</TableCell>
                   <TableCell>
