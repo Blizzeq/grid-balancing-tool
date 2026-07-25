@@ -829,7 +829,10 @@ describe("grid balancing simulation", () => {
     const candidates = buildDecisionCandidates(scenario, contracts, trades, 43, 12);
     const best = pickBestDecisionCandidate(candidates);
 
-    expect(candidates).toHaveLength(12);
+    // One fewer than the horizon: the first period inside the gate is no
+    // longer offered, because a recommendation you cannot trade is not advice.
+    expect(candidates).toHaveLength(11);
+    expect(candidates[0].periodIndex).toBeGreaterThan(43 + GATE_CLOSURE_LEAD_PERIODS);
     expect(best.orderDraft).toBeDefined();
     expect(best.periodIndex).toBeGreaterThan(43);
     expect(best.expectedImbalanceReductionMwh).toBeGreaterThan(0);

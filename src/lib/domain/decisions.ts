@@ -1,4 +1,9 @@
-import { buildKnownPeriodView, consumedLiquidityMwh, executeOrder } from "./markets";
+import {
+  GATE_CLOSURE_LEAD_PERIODS,
+  buildKnownPeriodView,
+  consumedLiquidityMwh,
+  executeOrder,
+} from "./markets";
 import { settlePeriod } from "./settlement";
 import type {
   Contract,
@@ -358,7 +363,13 @@ export function buildDecisionCandidates(
   const horizonEnd = Math.min(currentPeriod + horizonPeriods, scenario.periods.length - 1);
   const candidates: DecisionCandidate[] = [];
 
-  for (let periodIndex = currentPeriod + 1; periodIndex <= horizonEnd; periodIndex += 1) {
+  // Start past the gate: a candidate for a delivery that can no longer be
+  // traded is advice the player cannot act on.
+  for (
+    let periodIndex = currentPeriod + GATE_CLOSURE_LEAD_PERIODS + 1;
+    periodIndex <= horizonEnd;
+    periodIndex += 1
+  ) {
     const period = scenario.periods[periodIndex];
     const settlement = buildExpectedSettlement(
       scenario,

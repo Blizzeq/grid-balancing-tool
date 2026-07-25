@@ -8,7 +8,11 @@ import {
   buildOrderImpactPreview,
   type DecisionLogEntry,
 } from "../domain/decisions";
-import { buildDayAheadAuctionTrades, getScenarioSetupTrades } from "../domain/markets";
+import {
+  GATE_CLOSURE_LEAD_PERIODS,
+  buildDayAheadAuctionTrades,
+  getScenarioSetupTrades,
+} from "../domain/markets";
 import { getTradablePeriods } from "../domain/metrics";
 import { getPortfolioDefinition, parsePortfolioId } from "../domain/portfolios";
 import { createDefaultScenarioConfig, createScenario } from "../domain/scenarios";
@@ -373,7 +377,8 @@ export const useSimulationStore = create<SimulationStore>((set, get) => ({
       const isClosed = nextPeriod >= state.scenario.periods.length - 1;
       const nextTradablePeriod =
         getTradablePeriods(state.scenario, nextPeriod)[0] ?? state.scenario.periods[nextPeriod];
-      const shouldMoveOrderDraft = state.orderDraft.periodIndex <= nextPeriod;
+      const gateClosedThrough = nextPeriod + GATE_CLOSURE_LEAD_PERIODS;
+      const shouldMoveOrderDraft = state.orderDraft.periodIndex <= gateClosedThrough;
       const nextLimitPrice =
         state.orderDraft.side === "buy"
           ? Math.ceil(nextTradablePeriod.intradayAsk + 8)
@@ -386,7 +391,9 @@ export const useSimulationStore = create<SimulationStore>((set, get) => ({
         activeView: isClosed ? "replay" : state.activeView,
         mode: isClosed ? "replay" : state.mode,
         selectedPeriod:
-          state.selectedPeriod > nextPeriod ? state.selectedPeriod : nextTradablePeriod.index,
+          state.selectedPeriod > gateClosedThrough
+            ? state.selectedPeriod
+            : nextTradablePeriod.index,
         orderDraft: {
           ...state.orderDraft,
           periodIndex: shouldMoveOrderDraft
